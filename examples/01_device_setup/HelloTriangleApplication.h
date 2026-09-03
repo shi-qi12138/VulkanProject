@@ -4,6 +4,7 @@
 #include <GLFW/glfw3.h>
 
 #include <cstdint>
+#include <fstream>
 #include <optional>
 #include <vector>
 
@@ -71,6 +72,28 @@ private:
     // 创建交换链图像的视图，用于渲染和呈现。
     void createImageViews();
 
+    // 创建图形管线，包括着色器、固定功能阶段和渲染状态。
+    void createGraphicsPipeline();
+
+    // 创建渲染通道，定义渲染目标和子通道。
+    void createRenderPass();
+
+    // 创建交换链帧缓冲区，每个图像视图对应一个Framebuffer。
+    void createFramebuffers();
+
+    // 创建命令池，用于分配和管理命令缓冲区。
+    void createCommandPool();
+
+    // 创建命令缓冲区，用于记录绘制命令和状态切换。
+    void createCommandBuffers();
+
+    // 创建信号量和栅栏，用于同步图像获取、渲染和呈现。
+    void createSyncObjects();
+
+    // 渲染一帧图像：获取交换链图像、提交绘制命令、呈现到窗口。
+    void drawFrame();
+
+private:
     // 检查扩展、验证层和物理设备是否满足要求。
     // 检查系统是否支持GLFW所需的实例扩展。
     [[nodiscard]] bool checkGlfwRequiredExtensionsSupport() const;
@@ -78,6 +101,7 @@ private:
     // 检查Khronos验证层是否可用。
     [[nodiscard]] bool checkValidationLayerSupport() const;
 
+    // 判断GPU是否具备所需队列族和设备扩展。
     [[nodiscard]] bool isDeviceSuitable(VkPhysicalDevice device);
 
     // 检查GPU是否支持交换链等设备扩展。
@@ -109,6 +133,19 @@ private:
     // 从Surface支持的图像尺寸中选择最合适的一种。
     VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities);
 
+    // 创建着色器模块，用于图形管线的顶点和片段着色器。
+    VkShaderModule createShaderModule(const std::vector<char> &code);
+
+    // 记录命令缓冲区中的绘制命令。
+    void recordCommandBuffer(VkCommandBuffer commandBuffer,
+                             uint32_t imageIndex);
+
+    // 清理交换链及其相关资源。
+    void cleanupSwapChain();
+
+    // 当窗口大小发生变化时，重新创建交换链和相关资源。
+    void recreateSwapChain();
+
     // 配置并接收验证层输出的调试信息。
     // 填充Debug Messenger的创建参数。
     static void populateDebugMessengerCreateInfo(
@@ -121,7 +158,17 @@ private:
                   const VkDebugUtilsMessengerCallbackDataEXT *callbackData,
                   void *userData);
 
+    // 读取SPIR-V二进制文件到内存缓冲区。
+    static std::vector<char> readShaderFile(const std::string &filename);
+
+    // GLFW窗口尺寸变化时设置重建交换链标记。
+    static void framebufferResizeCallback(GLFWwindow *window, int width,
+                                          int height);
+
 private:
+    // 最大同时渲染帧数，通常为2或3。
+    const int MAX_FRAMES_IN_FLIGHT = 2;
+
     // 窗口初始宽度。
     static constexpr uint32_t WIDTH = 800;
 
@@ -167,6 +214,39 @@ private:
 
     // 交换链图像视图的列表，用于将图像绑定到渲染目标。
     std::vector<VkImageView> _swapChainImageViews;
+
+    // 渲染通道，定义渲染目标和子通道。
+    VkRenderPass _renderPass = VK_NULL_HANDLE;
+
+    // 管线布局，描述Shader可访问的Descriptor和Push Constant。
+    VkPipelineLayout _pipelineLayout = VK_NULL_HANDLE;
+
+    // 图形管线对象，包含Shader、固定功能阶段和渲染状态。
+    VkPipeline _graphicsPipeline = VK_NULL_HANDLE;
+
+    // 交换链帧缓冲区，每个图像视图对应一个Framebuffer。
+    std::vector<VkFramebuffer> _swapChainFramebuffers;
+
+    // 命令池，用于分配和管理命令缓冲区。
+    VkCommandPool _commandPool = VK_NULL_HANDLE;
+
+    // 命令缓冲区，用于记录绘制命令和状态切换。
+    std::vector<VkCommandBuffer> _commandBuffers;
+
+    // 信号量用于同步图像获取和渲染完成。
+    std::vector<VkSemaphore> _imageAvailableSemaphores;
+
+    // 每张交换链图像对应的“渲染完成”信号量。
+    std::vector<VkSemaphore> _renderFinishedSemaphores;
+
+    // 每个并行帧对应的Fence，防止CPU过早复用帧资源。
+    std::vector<VkFence> _inFlightFences;
+
+    // 窗口尺寸变化标记，在下一帧触发交换链重建。
+    bool _framebufferResized = false;
+
+    // 当前正在使用的并行帧索引。
+    uint32_t _currentFrame = 0;
 
     // 开发阶段使用Khronos官方验证层检查错误用法。
     const std::vector<const char *> _validationLayers = {

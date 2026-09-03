@@ -35,6 +35,12 @@ target_link_libraries(Vulkan02GraphicsPipeline PRIVATE VulkanFramework)
 
 Visual Studio重新配置CMake后，会把它显示为新的独立启动目标。
 
+## Shader 编译工具
+
+双击 `tools/启动Shader编译工具.bat` 可以打开图形化 Shader 编译工具。它会自动查找
+Vulkan SDK 中的 `glslc`，支持选择 Shader 文件、指定输出文件夹、选择 Shader 阶段、
+修改输出文件名，并在没有填写后缀时自动添加 `.spv`。
+
 ## 封装建议
 
 学习示例优先保留完整过程。当两个或更多示例出现相同代码时，再把公共部分移动到 `framework`，逐步形成自己的Vulkan封装。

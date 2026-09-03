@@ -31,6 +31,7 @@ createDebugUtilsMessenger(VkInstance instance,
 void destroyDebugUtilsMessenger(VkInstance instance,
                                 VkDebugUtilsMessengerEXT debugMessenger)
 {
+    // 销毁函数同样属于扩展，需要运行时获取函数地址。
     const auto function = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
         vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
 
@@ -66,12 +67,15 @@ void HelloTriangleApplication::initVulkan()
 
     // Vulkan负责渲染，不需要创建OpenGL上下文。
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
     _window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
     if (_window == nullptr) {
         throw std::runtime_error("GLFW窗口创建失败");
     }
+
+    // 把应用对象交给GLFW，尺寸回调可通过窗口取回this指针。
+    glfwSetWindowUserPointer(_window, this);
+    glfwSetFramebufferSizeCallback(_window, framebufferResizeCallback);
 
     createInstance();
     setupDebugMessenger();
@@ -80,6 +84,12 @@ void HelloTriangleApplication::initVulkan()
     createLogicalDevice();
     createSwapChain();
     createImageViews();
+    createRenderPass();
+    createGraphicsPipeline();
+    createFramebuffers();
+    createCommandPool();
+    createCommandBuffers();
+    createSyncObjects();
 }
 
 void HelloTriangleApplication::mainLoop()
@@ -87,24 +97,48 @@ void HelloTriangleApplication::mainLoop()
     // 窗口关闭前持续处理键盘、鼠标和窗口事件。
     while (!glfwWindowShouldClose(_window)) {
         glfwPollEvents();
+        drawFrame();
     }
+
+    vkDeviceWaitIdle(_device);
 }
 
 void HelloTriangleApplication::cleanup()
 {
-    // 销毁交换链图像视图，释放图像资源。
-    for (auto imageView : _swapChainImageViews) {
-        vkDestroyImageView(_device, imageView, nullptr);
+    // 销毁每帧和每张交换链图像使用的同步对象。
+    for (VkSemaphore semaphore : _renderFinishedSemaphores) {
+        vkDestroySemaphore(_device, semaphore, nullptr);
     }
 
-    // 销毁交换链对象，释放交换链图像和相关资源。
-    if (_device != VK_NULL_HANDLE && _swapChain != VK_NULL_HANDLE) {
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        vkDestroySemaphore(_device, _imageAvailableSemaphores[i], nullptr);
+        vkDestroyFence(_device, _inFlightFences[i], nullptr);
+    }
 
-        // 销毁对象：释放Vulkan内部资源
-        vkDestroySwapchainKHR(_device, _swapChain, nullptr);
+    // 销毁命令池，释放命令缓冲区和相关资源。
+    if (_commandPool != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(_device, _commandPool, nullptr);
+        _commandPool = VK_NULL_HANDLE;
+    }
 
-        // 句柄置空：修改程序自己的变量
-        _swapChain = VK_NULL_HANDLE;
+    cleanupSwapChain();
+
+    // 销毁图形管线对象，释放GPU资源。
+    if (_graphicsPipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(_device, _graphicsPipeline, nullptr);
+        _graphicsPipeline = VK_NULL_HANDLE;
+    }
+
+    // Pipeline Layout依赖Device，必须在销毁Device之前释放。
+    if (_pipelineLayout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(_device, _pipelineLayout, nullptr);
+        _pipelineLayout = VK_NULL_HANDLE;
+    }
+
+    // Render Pass依赖Device，需要在Device之前销毁。
+    if (_renderPass != VK_NULL_HANDLE) {
+        vkDestroyRenderPass(_device, _renderPass, nullptr);
+        _renderPass = VK_NULL_HANDLE;
     }
 
     // Vulkan资源按照创建顺序的反方向销毁。
@@ -246,6 +280,7 @@ bool HelloTriangleApplication::checkValidationLayerSupport() const
 
 bool HelloTriangleApplication::isDeviceSuitable(VkPhysicalDevice device)
 {
+    // 当前最低要求：同时拥有图形、呈现队列，并支持必需扩展。
     QueueFamilyIndices indices = findQueueFamilies(device);
 
     bool extensionsSupported = checkDeviceExtensionSupport(device);
@@ -332,12 +367,177 @@ VkExtent2D HelloTriangleApplication::chooseSwapExtent(
     }
 }
 
+VkShaderModule
+HelloTriangleApplication::createShaderModule(const std::vector<char> &code)
+{
+    // 创建着色器模块时需要提供SPIR-V字节码的大小和指针。
+    VkShaderModuleCreateInfo createInfo{};
+    createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    createInfo.codeSize = code.size();
+    createInfo.pCode = reinterpret_cast<const uint32_t *>(code.data());
+
+    VkShaderModule shaderModule = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(_device, &createInfo, nullptr, &shaderModule)
+        != VK_SUCCESS) {
+        throw std::runtime_error("着色器模块创建失败");
+    }
+    return shaderModule;
+}
+
+void HelloTriangleApplication::recordCommandBuffer(
+    VkCommandBuffer commandBuffer, uint32_t imageIndex)
+{
+    // 开始记录本帧发送给GPU的命令。
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = 0;                  // Optional
+    beginInfo.pInheritanceInfo = nullptr; // Optional
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        throw std::runtime_error("命令缓冲区开始记录失败");
+    }
+
+    // 选择当前交换链图像对应的Framebuffer并设置清屏范围。
+    VkRenderPassBeginInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    renderPassInfo.renderPass = _renderPass;
+    renderPassInfo.framebuffer = _swapChainFramebuffers[imageIndex];
+
+    renderPassInfo.renderArea.offset = {0, 0};
+    renderPassInfo.renderArea.extent = _swapChainExtent;
+
+    // 渲染开始时把颜色附件清除为不透明黑色。
+    VkClearValue clearColor = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
+    renderPassInfo.clearValueCount = 1;
+    renderPassInfo.pClearValues = &clearColor;
+
+    vkCmdBeginRenderPass(commandBuffer, &renderPassInfo,
+                         VK_SUBPASS_CONTENTS_INLINE);
+
+    // 绑定图形管线，后续绘制命令使用其中的渲染状态。
+    vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      _graphicsPipeline);
+
+    // Viewport和Scissor是动态状态，需要在每次记录时设置。
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(_swapChainExtent.width);
+    viewport.height = static_cast<float>(_swapChainExtent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = _swapChainExtent;
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+    // 绘制三个顶点，组成一个三角形。
+    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+    vkCmdEndRenderPass(commandBuffer);
+
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        throw std::runtime_error("命令缓冲区记录结束失败");
+    }
+}
+
+void HelloTriangleApplication::cleanupSwapChain()
+{
+    // 销毁交换链帧缓冲区，释放相关资源。
+    for (auto framebuffer : _swapChainFramebuffers) {
+        vkDestroyFramebuffer(_device, framebuffer, nullptr);
+    }
+    _swapChainFramebuffers.clear();
+
+    // 销毁交换链图像视图，释放图像资源。
+    for (auto imageView : _swapChainImageViews) {
+        vkDestroyImageView(_device, imageView, nullptr);
+    }
+    _swapChainImageViews.clear();
+    _swapChainImages.clear();
+
+    if (_swapChain != VK_NULL_HANDLE) {
+        // Swapchain拥有其中的VkImage，因此无需单独销毁图像。
+        vkDestroySwapchainKHR(_device, _swapChain, nullptr);
+        _swapChain = VK_NULL_HANDLE;
+    }
+}
+
+void HelloTriangleApplication::recreateSwapChain()
+{
+    // 窗口最小化时尺寸可能为0，等待窗口恢复后再创建交换链。
+    int width = 0, height = 0;
+    glfwGetFramebufferSize(_window, &width, &height);
+    while (width == 0 || height == 0) {
+        glfwGetFramebufferSize(_window, &width, &height);
+        glfwWaitEvents();
+    }
+
+    // 确保GPU不再使用旧交换链资源。
+    vkDeviceWaitIdle(_device);
+
+    cleanupSwapChain();
+
+    // 渲染完成信号量与交换链图像一一对应，需要同步重建。
+    for (VkSemaphore semaphore : _renderFinishedSemaphores) {
+        vkDestroySemaphore(_device, semaphore, nullptr);
+    }
+    _renderFinishedSemaphores.clear();
+
+    createSwapChain();
+    createImageViews();
+    createFramebuffers();
+
+    _renderFinishedSemaphores.resize(_swapChainImages.size());
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+    for (VkSemaphore &semaphore : _renderFinishedSemaphores) {
+        if (vkCreateSemaphore(_device, &semaphoreInfo, nullptr, &semaphore)
+            != VK_SUCCESS) {
+            throw std::runtime_error(
+                "重建渲染完成信号量失败");
+        }
+    }
+}
+
 VKAPI_ATTR VkBool32 VKAPI_CALL HelloTriangleApplication::debugCallback(
     VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT,
     const VkDebugUtilsMessengerCallbackDataEXT *callbackData, void *)
 {
     std::cerr << "Vulkan验证层：" << callbackData->pMessage << '\n';
     return VK_FALSE;
+}
+
+std::vector<char>
+HelloTriangleApplication::readShaderFile(const std::string &filename)
+{
+    // ate从文件尾开始，便于直接取得文件大小；binary避免文本转换。
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+
+    if (!file.is_open()) {
+        throw std::runtime_error("着色器文件打开失败：" + filename);
+    }
+
+    // 根据文件大小分配缓冲区，再回到开头读取全部字节。
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+    file.close();
+
+    return buffer;
+}
+
+void HelloTriangleApplication::framebufferResizeCallback(GLFWwindow *window,
+                                                         int width, int height)
+{
+    // 从GLFW取回应用对象，只设置标记，不在回调中直接重建资源。
+    auto app = reinterpret_cast<HelloTriangleApplication *>(
+        glfwGetWindowUserPointer(window));
+    app->_framebufferResized = true;
 }
 
 void HelloTriangleApplication::populateDebugMessengerCreateInfo(
@@ -408,8 +608,7 @@ void HelloTriangleApplication::pickPhysicalDevice()
     // 输出最终选中的物理设备名称，便于确认程序正在使用哪块GPU。
     VkPhysicalDeviceProperties deviceProperties{};
     vkGetPhysicalDeviceProperties(_physicalDevice, &deviceProperties);
-    std::cout << "当前使用的物理设备：" << deviceProperties.deviceName
-              << '\n';
+    std::cout << "当前使用的物理设备：" << deviceProperties.deviceName << '\n';
 }
 
 int HelloTriangleApplication::rateDeviceSuitability(
@@ -631,6 +830,361 @@ void HelloTriangleApplication::createImageViews()
             throw std::runtime_error("交换链图像视图创建失败");
         }
     }
+}
+
+void HelloTriangleApplication::createGraphicsPipeline()
+{
+    // 读取编译后的SPIR-V，并创建临时Shader Module。
+    auto vertShaderCode = readShaderFile("vert.spv");
+    auto fragShaderCode = readShaderFile("frag.spv");
+
+    VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
+    VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+
+    // 配置顶点着色器阶段，入口函数名为main。
+    VkPipelineShaderStageCreateInfo vertShaderStageInfo{};
+    vertShaderStageInfo.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vertShaderStageInfo.module = vertShaderModule;
+    vertShaderStageInfo.pName = "main";
+
+    // 配置片段着色器阶段，负责输出像素颜色。
+    VkPipelineShaderStageCreateInfo fragShaderStageInfo{};
+    fragShaderStageInfo.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    fragShaderStageInfo.module = fragShaderModule;
+    fragShaderStageInfo.pName = "main";
+
+    VkPipelineShaderStageCreateInfo shaderStages[] = {vertShaderStageInfo,
+                                                      fragShaderStageInfo};
+
+    // 当前顶点数据直接写在Shader中，因此不提供顶点输入。
+    VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
+    vertexInputInfo.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vertexInputInfo.vertexBindingDescriptionCount = 0;
+    vertexInputInfo.vertexAttributeDescriptionCount = 0;
+
+    // 每三个顶点组成一个独立三角形。
+    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
+    inputAssembly.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+    // Viewport和Scissor数量固定为1，具体值在绘制时动态设置。
+    VkPipelineViewportStateCreateInfo viewportState{};
+    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewportState.viewportCount = 1;
+    viewportState.scissorCount = 1;
+
+    // 光栅化阶段填充三角形，并剔除背面。
+    VkPipelineRasterizationStateCreateInfo rasterizer{};
+    rasterizer.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rasterizer.depthClampEnable = VK_FALSE;
+    rasterizer.rasterizerDiscardEnable = VK_FALSE;
+    rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+    rasterizer.lineWidth = 1.0f;
+    rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.depthBiasEnable = VK_FALSE;
+
+    // 当前关闭多重采样，每个像素只使用一个样本。
+    VkPipelineMultisampleStateCreateInfo multisampling{};
+    multisampling.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisampling.sampleShadingEnable = VK_FALSE;
+    multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // 允许写入RGBA四个通道，暂时关闭颜色混合。
+    VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+    colorBlendAttachment.colorWriteMask =
+        VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+        | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    colorBlendAttachment.blendEnable = VK_FALSE;
+
+    VkPipelineColorBlendStateCreateInfo colorBlending{};
+    colorBlending.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    colorBlending.logicOpEnable = VK_FALSE;
+    colorBlending.logicOp = VK_LOGIC_OP_COPY;
+    colorBlending.attachmentCount = 1;
+    colorBlending.pAttachments = &colorBlendAttachment;
+    colorBlending.blendConstants[0] = 0.0f;
+    colorBlending.blendConstants[1] = 0.0f;
+    colorBlending.blendConstants[2] = 0.0f;
+    colorBlending.blendConstants[3] = 0.0f;
+
+    // Viewport和Scissor设为动态状态，无需重建管线即可修改。
+    std::vector<VkDynamicState> dynamicStates = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                 VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamicState{};
+    dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamicState.dynamicStateCount =
+        static_cast<uint32_t>(dynamicStates.size());
+    dynamicState.pDynamicStates = dynamicStates.data();
+
+    // 当前没有Descriptor Set和Push Constant，先创建空管线布局。
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 0;
+    pipelineLayoutInfo.pushConstantRangeCount = 0;
+
+    if (vkCreatePipelineLayout(_device, &pipelineLayoutInfo, nullptr,
+                               &_pipelineLayout)
+        != VK_SUCCESS) {
+        throw std::runtime_error("图形管线布局创建失败");
+    }
+
+    VkGraphicsPipelineCreateInfo pipelineInfo{};
+    pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pipelineInfo.stageCount = 2;
+    pipelineInfo.pStages = shaderStages;
+    pipelineInfo.pVertexInputState = &vertexInputInfo;
+    pipelineInfo.pInputAssemblyState = &inputAssembly;
+    pipelineInfo.pViewportState = &viewportState;
+    pipelineInfo.pRasterizationState = &rasterizer;
+    pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pColorBlendState = &colorBlending;
+    pipelineInfo.pDynamicState = &dynamicState;
+    pipelineInfo.layout = _pipelineLayout;
+    pipelineInfo.renderPass = _renderPass;
+    pipelineInfo.subpass = 0;
+    pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
+
+    if (vkCreateGraphicsPipelines(_device, VK_NULL_HANDLE, 1, &pipelineInfo,
+                                  nullptr, &_graphicsPipeline)
+        != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan图形管线创建失败");
+    }
+
+    // 管线布局创建后不再需要Shader Module，可以立即释放。
+    vkDestroyShaderModule(_device, fragShaderModule, nullptr);
+    vkDestroyShaderModule(_device, vertShaderModule, nullptr);
+}
+
+void HelloTriangleApplication::createRenderPass()
+{
+    // 颜色附件对应交换链图像：开始时清屏，结束后保留内容用于呈现。
+    VkAttachmentDescription colorAttachment{};
+    colorAttachment.format = _swapChainImageFormat;
+    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+    // 子通道执行期间，图像使用最适合颜色写入的布局。
+    VkAttachmentReference colorAttachmentRef{};
+    colorAttachmentRef.attachment = 0;
+    colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+    // 当前Render Pass只有一个图形子通道和一个颜色附件。
+    VkSubpassDescription subpass{};
+    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    subpass.colorAttachmentCount = 1;
+    subpass.pColorAttachments = &colorAttachmentRef;
+
+    // 等待颜色附件可用后，才允许子通道写入颜色。
+    VkSubpassDependency dependency{};
+    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dependency.dstSubpass = 0;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dependency.srcAccessMask = 0;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+    VkRenderPassCreateInfo renderPassInfo{};
+    renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+    renderPassInfo.attachmentCount = 1;
+    renderPassInfo.pAttachments = &colorAttachment;
+
+    renderPassInfo.subpassCount = 1;
+    renderPassInfo.pSubpasses = &subpass;
+
+    renderPassInfo.dependencyCount = 1;
+    renderPassInfo.pDependencies = &dependency;
+
+    if (vkCreateRenderPass(_device, &renderPassInfo, nullptr, &_renderPass)
+        != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan渲染通道创建失败");
+    }
+}
+
+void HelloTriangleApplication::createFramebuffers()
+{
+    // 每个交换链Image View都需要一个对应的Framebuffer。
+    _swapChainFramebuffers.resize(_swapChainImageViews.size());
+
+    for (size_t i = 0; i < _swapChainImageViews.size(); i++) {
+        VkImageView attachments[] = {_swapChainImageViews[i]};
+
+        VkFramebufferCreateInfo framebufferInfo{};
+        framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+        framebufferInfo.renderPass = _renderPass;
+        framebufferInfo.attachmentCount = 1;
+        framebufferInfo.pAttachments = attachments;
+        framebufferInfo.width = _swapChainExtent.width;
+        framebufferInfo.height = _swapChainExtent.height;
+        framebufferInfo.layers = 1;
+
+        if (vkCreateFramebuffer(_device, &framebufferInfo, nullptr,
+                                &_swapChainFramebuffers[i])
+            != VK_SUCCESS) {
+            throw std::runtime_error("Vulkan帧缓冲区创建失败");
+        }
+    }
+}
+
+void HelloTriangleApplication::createCommandPool()
+{
+    // 命令池必须属于实际执行绘制命令的图形队列族。
+    QueueFamilyIndices queueFamilies = findQueueFamilies(_physicalDevice);
+
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = queueFamilies.graphicsFamily.value();
+
+    if (vkCreateCommandPool(_device, &poolInfo, nullptr, &_commandPool)
+        != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan命令池创建失败");
+    }
+}
+
+void HelloTriangleApplication::createCommandBuffers()
+{
+    // 每个并行帧分配一个可重复记录的主命令缓冲区。
+    _commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = _commandPool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = (uint32_t)_commandBuffers.size();
+
+    if (vkAllocateCommandBuffers(_device, &allocInfo, _commandBuffers.data())
+        != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan命令缓冲区分配失败");
+    }
+}
+
+void HelloTriangleApplication::createSyncObjects()
+{
+    // 获取图像和Fence按并行帧管理；渲染完成信号量按交换链图像管理。
+    _imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+    _renderFinishedSemaphores.resize(_swapChainImages.size());
+    _inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
+    VkSemaphoreCreateInfo semaphoreInfo{};
+    semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+    // Fence初始为已触发，避免第一帧永久等待。
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        if (vkCreateSemaphore(_device, &semaphoreInfo, nullptr,
+                              &_imageAvailableSemaphores[i])
+                != VK_SUCCESS
+            || vkCreateFence(_device, &fenceInfo, nullptr, &_inFlightFences[i])
+                   != VK_SUCCESS) {
+
+            throw std::runtime_error(
+                "帧同步对象创建失败");
+        }
+    }
+
+    for (VkSemaphore &semaphore : _renderFinishedSemaphores) {
+        if (vkCreateSemaphore(_device, &semaphoreInfo, nullptr, &semaphore)
+            != VK_SUCCESS) {
+            throw std::runtime_error(
+                "渲染完成信号量创建失败");
+        }
+    }
+}
+
+void HelloTriangleApplication::drawFrame()
+{
+    // 等待当前帧上一次提交完成，确保可以安全复用资源。
+    vkWaitForFences(_device, 1, &_inFlightFences[_currentFrame], VK_TRUE,
+                    UINT64_MAX);
+
+    uint32_t imageIndex;
+    // 获取下一张可渲染的交换链图像。
+    VkResult result = vkAcquireNextImageKHR(
+        _device, _swapChain, UINT64_MAX,
+        _imageAvailableSemaphores[_currentFrame], VK_NULL_HANDLE, &imageIndex);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+        recreateSwapChain();
+        return;
+    } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        throw std::runtime_error("获取交换链图像失败");
+    }
+
+    // 准备重新提交当前帧，并重新记录它的命令缓冲区。
+    vkResetFences(_device, 1, &_inFlightFences[_currentFrame]);
+
+    vkResetCommandBuffer(_commandBuffers[_currentFrame],
+                         /*VkCommandBufferResetFlagBits*/ 0);
+    recordCommandBuffer(_commandBuffers[_currentFrame], imageIndex);
+
+    // 等待图像可用后执行绘制，完成后触发渲染完成信号量。
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+    VkSemaphore waitSemaphores[] = {_imageAvailableSemaphores[_currentFrame]};
+    VkPipelineStageFlags waitStages[] = {
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &_commandBuffers[_currentFrame];
+
+    VkSemaphore signalSemaphores[] = {_renderFinishedSemaphores[imageIndex]};
+    submitInfo.signalSemaphoreCount = 1;
+    submitInfo.pSignalSemaphores = signalSemaphores;
+
+    if (vkQueueSubmit(_graphicsQueue, 1, &submitInfo,
+                      _inFlightFences[_currentFrame])
+        != VK_SUCCESS) {
+        throw std::runtime_error("绘制命令提交失败");
+    }
+
+    // 等待绘制结束，再把当前交换链图像提交给窗口系统显示。
+    VkPresentInfoKHR presentInfo{};
+    presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+
+    presentInfo.waitSemaphoreCount = 1;
+    presentInfo.pWaitSemaphores = signalSemaphores;
+
+    VkSwapchainKHR swapChains[] = {_swapChain};
+    presentInfo.swapchainCount = 1;
+    presentInfo.pSwapchains = swapChains;
+
+    presentInfo.pImageIndices = &imageIndex;
+
+    result = vkQueuePresentKHR(_presentQueue, &presentInfo);
+
+    if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR
+        || _framebufferResized) {
+        _framebufferResized = false;
+        recreateSwapChain();
+    } else if (result != VK_SUCCESS) {
+        throw std::runtime_error("交换链图像呈现失败");
+    }
+
+    // 循环使用有限数量的帧资源。
+    _currentFrame = (_currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
 }
 
 bool HelloTriangleApplication::checkDeviceExtensionSupport(
