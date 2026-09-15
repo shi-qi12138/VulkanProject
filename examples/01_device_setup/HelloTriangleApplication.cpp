@@ -87,8 +87,13 @@ void HelloTriangleApplication::initVulkan()
     createRenderPass();
     createGraphicsPipeline();
     createFramebuffers();
-    createVertexBuffer();
+
+    // 顶点数据上传需要临时命令缓冲区，因此必须先创建命令池。
     createCommandPool();
+
+    createVertexBuffer();
+    createIndexBuffer();
+
     createCommandBuffers();
     createSyncObjects();
 }
@@ -124,6 +129,7 @@ void HelloTriangleApplication::cleanup()
 
     cleanupSwapChain();
 
+    // 销毁顶点缓冲区和索引缓冲区，释放GPU内存。
     if (_vertexBuffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(_device, _vertexBuffer, nullptr);
         _vertexBuffer = VK_NULL_HANDLE;
@@ -132,6 +138,16 @@ void HelloTriangleApplication::cleanup()
     if (_vertexBufferMemory != VK_NULL_HANDLE) {
         vkFreeMemory(_device, _vertexBufferMemory, nullptr);
         _vertexBufferMemory = VK_NULL_HANDLE;
+    }
+
+    if (_indexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(_device, _indexBuffer, nullptr);
+        _indexBuffer = VK_NULL_HANDLE;
+    }
+
+    if (_indexBufferMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(_device, _indexBufferMemory, nullptr);
+        _indexBufferMemory = VK_NULL_HANDLE;
     }
 
     // 销毁图形管线对象，释放GPU资源。
@@ -429,11 +445,6 @@ void HelloTriangleApplication::recordCommandBuffer(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       _graphicsPipeline);
 
-    // 绑定顶点缓冲区，告诉GPU从哪里读取顶点数据。
-    VkBuffer vertexBuffers[] = {_vertexBuffer};
-    VkDeviceSize offsets[] = {0};
-    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
-
     // Viewport和Scissor是动态状态，需要在每次记录时设置。
     VkViewport viewport{};
     viewport.x = 0.0f;
@@ -449,8 +460,23 @@ void HelloTriangleApplication::recordCommandBuffer(
     scissor.extent = _swapChainExtent;
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    // 绘制全部六个顶点，由两个三角形拼成一个矩形。
-    vkCmdDraw(commandBuffer, static_cast<uint32_t>(_vertices.size()), 1, 0, 0);
+    // 绑定顶点缓冲区，告诉GPU从哪里读取顶点数据。
+    VkBuffer vertexBuffers[] = {_vertexBuffer};
+    VkDeviceSize offsets[] = {0};
+
+    // 绑定顶点缓冲区时，指定缓冲区和偏移量，GPU将从该缓冲区读取顶点数据。
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
+    // 绑定索引缓冲区，告诉GPU从哪里读取顶点索引数据。
+    vkCmdBindIndexBuffer(commandBuffer, _indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+    // 使用顶点绘制三角形，指定顶点数量、实例数量、起始顶点和实例偏移。
+    // vkCmdDraw(commandBuffer, static_cast<uint32_t>(_vertices.size()), 1, 0,
+    // 0);
+
+    // 使用索引绘制三角形，指定索引数量、实例数量、起始索引和顶点偏移。
+    vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(_indices.size()), 1,
+                     0, 0, 0);
 
     vkCmdEndRenderPass(commandBuffer);
 
@@ -1099,52 +1125,149 @@ void HelloTriangleApplication::createCommandPool()
 
 void HelloTriangleApplication::createVertexBuffer()
 {
-    // 创建顶点缓冲区，存储三角形的顶点数据。
+    VkDeviceSize bufferSize = sizeof(_vertices[0]) * _vertices.size();
+
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingBufferMemory;
+    createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                     | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 stagingBuffer, stagingBufferMemory);
+
+    void *data;
+    vkMapMemory(_device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, _vertices.data(), (size_t)bufferSize);
+    vkUnmapMemory(_device, stagingBufferMemory);
+
+    createBuffer(bufferSize,
+                 VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                     | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _vertexBuffer,
+                 _vertexBufferMemory);
+
+    copyBuffer(stagingBuffer, _vertexBuffer, bufferSize);
+
+    vkDestroyBuffer(_device, stagingBuffer, nullptr);
+    vkFreeMemory(_device, stagingBufferMemory, nullptr);
+}
+
+void HelloTriangleApplication::createIndexBuffer()
+{
+    VkDeviceSize bufferSize = sizeof(_indices[0]) * _indices.size();
+
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingBufferMemory;
+    createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                     | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                 stagingBuffer, stagingBufferMemory);
+
+    void *data;
+    vkMapMemory(_device, stagingBufferMemory, 0, bufferSize, 0, &data);
+    memcpy(data, _indices.data(), (size_t)bufferSize);
+    vkUnmapMemory(_device, stagingBufferMemory);
+
+    createBuffer(
+        bufferSize,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _indexBuffer, _indexBufferMemory);
+
+    copyBuffer(stagingBuffer, _indexBuffer, bufferSize);
+
+    vkDestroyBuffer(_device, stagingBuffer, nullptr);
+    vkFreeMemory(_device, stagingBufferMemory, nullptr);
+}
+
+void HelloTriangleApplication::createBuffer(VkDeviceSize size,
+                                            VkBufferUsageFlags usage,
+                                            VkMemoryPropertyFlags properties,
+                                            VkBuffer &buffer,
+                                            VkDeviceMemory &bufferMemory)
+{
     VkBufferCreateInfo bufferInfo{};
     bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = sizeof(_vertices[0]) * _vertices.size();
-    bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bufferInfo.size = size;
+    bufferInfo.usage = usage;
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    // 创建顶点缓冲区对象，并检查返回值是否成功。
-    if (vkCreateBuffer(_device, &bufferInfo, nullptr, &_vertexBuffer)
-        != VK_SUCCESS) {
-        throw std::runtime_error("Vulkan顶点缓冲区创建失败");
+    if (vkCreateBuffer(_device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create buffer!");
     }
 
-    // 查询顶点缓冲区的内存需求，包括大小、对齐方式和内存类型。
     VkMemoryRequirements memRequirements;
-    vkGetBufferMemoryRequirements(_device, _vertexBuffer, &memRequirements);
+    vkGetBufferMemoryRequirements(_device, buffer, &memRequirements);
 
-    // 根据内存需求和所需属性，选择合适的内存类型，并分配内存。
     VkMemoryAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     allocInfo.allocationSize = memRequirements.size;
     allocInfo.memoryTypeIndex =
-        findMemoryType(memRequirements.memoryTypeBits,
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                           | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        findMemoryType(memRequirements.memoryTypeBits, properties);
 
-    // 分配满足缓冲区大小和内存类型要求的设备内存。
-    if (vkAllocateMemory(_device, &allocInfo, nullptr, &_vertexBufferMemory)
+    if (vkAllocateMemory(_device, &allocInfo, nullptr, &bufferMemory)
         != VK_SUCCESS) {
-        throw std::runtime_error("Vulkan顶点缓冲区内存分配失败");
+        throw std::runtime_error("failed to allocate buffer memory!");
     }
 
-    // VkBuffer只是资源描述，必须绑定VkDeviceMemory后才能被GPU使用。
-    if (vkBindBufferMemory(_device, _vertexBuffer, _vertexBufferMemory, 0)
-        != VK_SUCCESS) {
-        throw std::runtime_error("顶点缓冲区与设备内存绑定失败");
+    if (vkBindBufferMemory(_device, buffer, bufferMemory, 0) != VK_SUCCESS) {
+        throw std::runtime_error("缓冲区与设备内存绑定失败");
+    }
+}
+
+void HelloTriangleApplication::copyBuffer(VkBuffer srcBuffer,
+                                          VkBuffer dstBuffer, VkDeviceSize size)
+{
+    if (_commandPool == VK_NULL_HANDLE) {
+        throw std::runtime_error("复制缓冲区前必须先创建命令池");
     }
 
-    // 映射CPU可见内存，并把顶点数据复制进去。
-    void *data = nullptr;
-    if (vkMapMemory(_device, _vertexBufferMemory, 0, bufferInfo.size, 0, &data)
+    // 从命令池临时分配一个只执行一次的命令缓冲区。
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = _commandPool;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(_device, &allocInfo, &commandBuffer)
         != VK_SUCCESS) {
-        throw std::runtime_error("顶点缓冲区内存映射失败");
+        throw std::runtime_error("临时复制命令缓冲区分配失败");
     }
-    std::memcpy(data, _vertices.data(), static_cast<size_t>(bufferInfo.size));
-    vkUnmapMemory(_device, _vertexBufferMemory);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("临时复制命令缓冲区开始记录失败");
+    }
+
+    VkBufferCopy copyRegion{};
+    copyRegion.size = size;
+    vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("临时复制命令缓冲区记录失败");
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    if (vkQueueSubmit(_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE)
+        != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("缓冲区复制命令提交失败");
+    }
+
+    // 等待复制完成后，释放临时命令缓冲区。
+    if (vkQueueWaitIdle(_graphicsQueue) != VK_SUCCESS) {
+        throw std::runtime_error("等待缓冲区复制完成失败");
+    }
+
+    vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
 }
 
 void HelloTriangleApplication::createCommandBuffers()

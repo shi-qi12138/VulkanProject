@@ -129,6 +129,17 @@ private:
     // 创建顶点缓冲区，用于存储顶点数据。
     void createVertexBuffer();
 
+    // 创建索引缓冲区，用于存储顶点索引数据。
+    void createIndexBuffer();
+
+    // 在GPU内存中为缓冲区分配合适的内存类型，并创建缓冲区对象。
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags properties, VkBuffer &buffer,
+                      VkDeviceMemory &bufferMemory);
+
+    // 使用命令缓冲区将数据从源缓冲区复制到目标缓冲区。
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size);
+
     // 创建命令缓冲区，用于记录绘制命令和状态切换。
     void createCommandBuffers();
 
@@ -297,6 +308,12 @@ private:
     // 顶点缓冲区的GPU内存句柄。
     VkDeviceMemory _vertexBufferMemory = VK_NULL_HANDLE;
 
+    // 索引缓冲区，用于存储顶点索引数据。
+    VkBuffer _indexBuffer = VK_NULL_HANDLE;
+
+    // 索引缓冲区的GPU内存句柄。
+    VkDeviceMemory _indexBufferMemory = VK_NULL_HANDLE;
+
     // 窗口尺寸变化标记，在下一帧触发交换链重建。
     bool _framebufferResized = false;
 
@@ -320,15 +337,10 @@ private:
 #endif
 
 private:
-    const std::vector<Vertex> _vertices = {
-        // 第一个三角形：A → B → C，逆时针
-        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // A 左下
-        {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},  // B 右下
-        {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},   // C 右上
+    const std::vector<Vertex> _vertices = {{{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+                                           {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+                                           {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+                                           {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}};
 
-        // 第二个三角形：A → C → D，逆时针
-        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // A 左下
-        {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},   // C 右上
-        {{-0.5f, 0.5f}, {0.0f, 1.0f, 1.0f}}   // D 左上
-    };
+    const std::vector<uint16_t> _indices = {0, 1, 2, 2, 3, 0};
 };
