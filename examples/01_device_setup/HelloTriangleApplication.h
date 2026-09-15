@@ -3,6 +3,8 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
+#include "glm/glm.hpp"
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <optional>
@@ -31,6 +33,46 @@ struct SwapChainSupportDetails
 
     // Surface支持的图像呈现模式。
     std::vector<VkPresentModeKHR> presentModes;
+};
+
+// 顶点数据结构，包含位置和颜色属性。
+struct Vertex
+{
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    // 返回顶点输入绑定描述符，告诉Vulkan如何解释顶点缓冲区数据。
+    static VkVertexInputBindingDescription getBindingDescription()
+    {
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    // 返回顶点输入属性描述符数组，告诉Vulkan每个顶点属性的位置、格式和偏移量。
+    static std::array<VkVertexInputAttributeDescription, 2>
+    getAttributeDescriptions()
+    {
+        std::array<VkVertexInputAttributeDescription, 2>
+            attributeDescriptions{};
+
+        // 位置属性描述符，绑定到顶点缓冲区的第0个绑定点，格式为2个32位浮点数。
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        // 颜色属性描述符，绑定到顶点缓冲区的第0个绑定点，格式为3个32位浮点数。
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
 };
 
 class HelloTriangleApplication
@@ -83,6 +125,9 @@ private:
 
     // 创建命令池，用于分配和管理命令缓冲区。
     void createCommandPool();
+
+    // 创建顶点缓冲区，用于存储顶点数据。
+    void createVertexBuffer();
 
     // 创建命令缓冲区，用于记录绘制命令和状态切换。
     void createCommandBuffers();
@@ -145,6 +190,10 @@ private:
 
     // 当窗口大小发生变化时，重新创建交换链和相关资源。
     void recreateSwapChain();
+
+    // 在GPU内存中为缓冲区分配合适的内存类型。
+    uint32_t findMemoryType(uint32_t typeFilter,
+                            VkMemoryPropertyFlags properties);
 
     // 配置并接收验证层输出的调试信息。
     // 填充Debug Messenger的创建参数。
@@ -242,6 +291,12 @@ private:
     // 每个并行帧对应的Fence，防止CPU过早复用帧资源。
     std::vector<VkFence> _inFlightFences;
 
+    // 顶点缓冲区，用于存储顶点数据。
+    VkBuffer _vertexBuffer = VK_NULL_HANDLE;
+
+    // 顶点缓冲区的GPU内存句柄。
+    VkDeviceMemory _vertexBufferMemory = VK_NULL_HANDLE;
+
     // 窗口尺寸变化标记，在下一帧触发交换链重建。
     bool _framebufferResized = false;
 
@@ -263,4 +318,17 @@ private:
     // Debug模式启用验证层以检查Vulkan错误用法。
     static constexpr bool _enableValidationLayers = true;
 #endif
+
+private:
+    const std::vector<Vertex> _vertices = {
+        // 第一个三角形：A → B → C，逆时针
+        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // A 左下
+        {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},  // B 右下
+        {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},   // C 右上
+
+        // 第二个三角形：A → C → D，逆时针
+        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}}, // A 左下
+        {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},   // C 右上
+        {{-0.5f, 0.5f}, {0.0f, 1.0f, 1.0f}}   // D 左上
+    };
 };

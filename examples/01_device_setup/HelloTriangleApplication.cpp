@@ -87,6 +87,7 @@ void HelloTriangleApplication::initVulkan()
     createRenderPass();
     createGraphicsPipeline();
     createFramebuffers();
+    createVertexBuffer();
     createCommandPool();
     createCommandBuffers();
     createSyncObjects();
@@ -122,6 +123,16 @@ void HelloTriangleApplication::cleanup()
     }
 
     cleanupSwapChain();
+
+    if (_vertexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(_device, _vertexBuffer, nullptr);
+        _vertexBuffer = VK_NULL_HANDLE;
+    }
+
+    if (_vertexBufferMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(_device, _vertexBufferMemory, nullptr);
+        _vertexBufferMemory = VK_NULL_HANDLE;
+    }
 
     // 销毁图形管线对象，释放GPU资源。
     if (_graphicsPipeline != VK_NULL_HANDLE) {
@@ -418,6 +429,11 @@ void HelloTriangleApplication::recordCommandBuffer(
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                       _graphicsPipeline);
 
+    // 绑定顶点缓冲区，告诉GPU从哪里读取顶点数据。
+    VkBuffer vertexBuffers[] = {_vertexBuffer};
+    VkDeviceSize offsets[] = {0};
+    vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
     // Viewport和Scissor是动态状态，需要在每次记录时设置。
     VkViewport viewport{};
     viewport.x = 0.0f;
@@ -433,8 +449,8 @@ void HelloTriangleApplication::recordCommandBuffer(
     scissor.extent = _swapChainExtent;
     vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
-    // 绘制三个顶点，组成一个三角形。
-    vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+    // 绘制全部六个顶点，由两个三角形拼成一个矩形。
+    vkCmdDraw(commandBuffer, static_cast<uint32_t>(_vertices.size()), 1, 0, 0);
 
     vkCmdEndRenderPass(commandBuffer);
 
@@ -496,10 +512,26 @@ void HelloTriangleApplication::recreateSwapChain()
     for (VkSemaphore &semaphore : _renderFinishedSemaphores) {
         if (vkCreateSemaphore(_device, &semaphoreInfo, nullptr, &semaphore)
             != VK_SUCCESS) {
-            throw std::runtime_error(
-                "重建渲染完成信号量失败");
+            throw std::runtime_error("重建渲染完成信号量失败");
         }
     }
+}
+
+uint32_t
+HelloTriangleApplication::findMemoryType(uint32_t typeFilter,
+                                         VkMemoryPropertyFlags properties)
+{
+    // 查询物理设备的内存类型和堆信息。
+    VkPhysicalDeviceMemoryProperties memProperties;
+    vkGetPhysicalDeviceMemoryProperties(_physicalDevice, &memProperties);
+    for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+        if ((typeFilter & (1 << i))
+            && (memProperties.memoryTypes[i].propertyFlags & properties)
+                   == properties) {
+            return i;
+        }
+    }
+    throw std::runtime_error("未找到合适的内存类型");
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL HelloTriangleApplication::debugCallback(
@@ -835,7 +867,7 @@ void HelloTriangleApplication::createImageViews()
 void HelloTriangleApplication::createGraphicsPipeline()
 {
     // 读取编译后的SPIR-V，并创建临时Shader Module。
-    auto vertShaderCode = readShaderFile("vert.spv");
+    auto vertShaderCode = readShaderFile("vertIn.spv");
     auto fragShaderCode = readShaderFile("frag.spv");
 
     VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
@@ -864,8 +896,16 @@ void HelloTriangleApplication::createGraphicsPipeline()
     VkPipelineVertexInputStateCreateInfo vertexInputInfo{};
     vertexInputInfo.sType =
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInputInfo.vertexBindingDescriptionCount = 0;
-    vertexInputInfo.vertexAttributeDescriptionCount = 0;
+
+    // 获取顶点绑定描述符和属性描述符，用于告诉GPU如何解释顶点数据。
+    auto bindingDescription = Vertex::getBindingDescription();
+    auto attributeDescriptions = Vertex::getAttributeDescriptions();
+
+    vertexInputInfo.vertexBindingDescriptionCount = 1;
+    vertexInputInfo.vertexAttributeDescriptionCount =
+        static_cast<uint32_t>(attributeDescriptions.size());
+    vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
+    vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
     // 每三个顶点组成一个独立三角形。
     VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
@@ -1057,6 +1097,56 @@ void HelloTriangleApplication::createCommandPool()
     }
 }
 
+void HelloTriangleApplication::createVertexBuffer()
+{
+    // 创建顶点缓冲区，存储三角形的顶点数据。
+    VkBufferCreateInfo bufferInfo{};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = sizeof(_vertices[0]) * _vertices.size();
+    bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    // 创建顶点缓冲区对象，并检查返回值是否成功。
+    if (vkCreateBuffer(_device, &bufferInfo, nullptr, &_vertexBuffer)
+        != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan顶点缓冲区创建失败");
+    }
+
+    // 查询顶点缓冲区的内存需求，包括大小、对齐方式和内存类型。
+    VkMemoryRequirements memRequirements;
+    vkGetBufferMemoryRequirements(_device, _vertexBuffer, &memRequirements);
+
+    // 根据内存需求和所需属性，选择合适的内存类型，并分配内存。
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex =
+        findMemoryType(memRequirements.memoryTypeBits,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                           | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    // 分配满足缓冲区大小和内存类型要求的设备内存。
+    if (vkAllocateMemory(_device, &allocInfo, nullptr, &_vertexBufferMemory)
+        != VK_SUCCESS) {
+        throw std::runtime_error("Vulkan顶点缓冲区内存分配失败");
+    }
+
+    // VkBuffer只是资源描述，必须绑定VkDeviceMemory后才能被GPU使用。
+    if (vkBindBufferMemory(_device, _vertexBuffer, _vertexBufferMemory, 0)
+        != VK_SUCCESS) {
+        throw std::runtime_error("顶点缓冲区与设备内存绑定失败");
+    }
+
+    // 映射CPU可见内存，并把顶点数据复制进去。
+    void *data = nullptr;
+    if (vkMapMemory(_device, _vertexBufferMemory, 0, bufferInfo.size, 0, &data)
+        != VK_SUCCESS) {
+        throw std::runtime_error("顶点缓冲区内存映射失败");
+    }
+    std::memcpy(data, _vertices.data(), static_cast<size_t>(bufferInfo.size));
+    vkUnmapMemory(_device, _vertexBufferMemory);
+}
+
 void HelloTriangleApplication::createCommandBuffers()
 {
     // 每个并行帧分配一个可重复记录的主命令缓冲区。
@@ -1096,16 +1186,14 @@ void HelloTriangleApplication::createSyncObjects()
             || vkCreateFence(_device, &fenceInfo, nullptr, &_inFlightFences[i])
                    != VK_SUCCESS) {
 
-            throw std::runtime_error(
-                "帧同步对象创建失败");
+            throw std::runtime_error("帧同步对象创建失败");
         }
     }
 
     for (VkSemaphore &semaphore : _renderFinishedSemaphores) {
         if (vkCreateSemaphore(_device, &semaphoreInfo, nullptr, &semaphore)
             != VK_SUCCESS) {
-            throw std::runtime_error(
-                "渲染完成信号量创建失败");
+            throw std::runtime_error("渲染完成信号量创建失败");
         }
     }
 }
