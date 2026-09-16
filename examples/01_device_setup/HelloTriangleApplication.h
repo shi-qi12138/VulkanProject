@@ -5,8 +5,11 @@
 
 #include "glm/glm.hpp"
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 #include <optional>
 #include <vector>
 
@@ -75,6 +78,13 @@ struct Vertex
     }
 };
 
+struct UniformBufferObject
+{
+    glm::mat4 model;
+    glm::mat4 view;
+    glm::mat4 proj;
+};
+
 class HelloTriangleApplication
 {
 public:
@@ -114,6 +124,9 @@ private:
     // 创建交换链图像的视图，用于渲染和呈现。
     void createImageViews();
 
+    // 创建描述符集布局，定义Uniform Buffer的绑定方式。
+    void createDescriptorSetLayout();
+
     // 创建图形管线，包括着色器、固定功能阶段和渲染状态。
     void createGraphicsPipeline();
 
@@ -132,6 +145,15 @@ private:
     // 创建索引缓冲区，用于存储顶点索引数据。
     void createIndexBuffer();
 
+    // 创建Uniform Buffer，用于存储变换矩阵等数据。
+    void createUniformBuffers();
+
+    // 创建描述符池，用于分配描述符集。
+    void createDescriptorPool();
+
+    // 创建描述符集，将Uniform Buffer绑定到管线。
+    void createDescriptorSets();
+
     // 在GPU内存中为缓冲区分配合适的内存类型，并创建缓冲区对象。
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
                       VkMemoryPropertyFlags properties, VkBuffer &buffer,
@@ -145,6 +167,9 @@ private:
 
     // 创建信号量和栅栏，用于同步图像获取、渲染和呈现。
     void createSyncObjects();
+
+    // 更新Uniform Buffer的数据，例如模型、视图和投影矩阵。
+    void updateUniformBuffer(uint32_t currentImage);
 
     // 渲染一帧图像：获取交换链图像、提交绘制命令、呈现到窗口。
     void drawFrame();
@@ -278,6 +303,15 @@ private:
     // 渲染通道，定义渲染目标和子通道。
     VkRenderPass _renderPass = VK_NULL_HANDLE;
 
+    // 描述符集布局，定义Uniform Buffer的绑定方式。
+    VkDescriptorSetLayout _descriptorSetLayout = VK_NULL_HANDLE;
+
+    // 描述符池，用于分配描述符集。
+    VkDescriptorPool _descriptorPool = VK_NULL_HANDLE;
+
+    // 描述符集，将Uniform Buffer绑定到管线。
+    std::vector<VkDescriptorSet> _descriptorSets;
+
     // 管线布局，描述Shader可访问的Descriptor和Push Constant。
     VkPipelineLayout _pipelineLayout = VK_NULL_HANDLE;
 
@@ -313,6 +347,15 @@ private:
 
     // 索引缓冲区的GPU内存句柄。
     VkDeviceMemory _indexBufferMemory = VK_NULL_HANDLE;
+
+    // Uniform Buffer对象，用于存储每帧的变换矩阵。
+    std::vector<VkBuffer> _uniformBuffers;
+
+    // Uniform Buffer的GPU内存句柄，用于存储每帧的变换矩阵。
+    std::vector<VkDeviceMemory> _uniformBuffersMemory;
+
+    // Uniform Buffer的CPU可访问内存映射指针，用于更新每帧的变换矩阵。
+    std::vector<void *> _uniformBuffersMapped;
 
     // 窗口尺寸变化标记，在下一帧触发交换链重建。
     bool _framebufferResized = false;

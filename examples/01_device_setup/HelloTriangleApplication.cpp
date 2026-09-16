@@ -85,7 +85,10 @@ void HelloTriangleApplication::initVulkan()
     createSwapChain();
     createImageViews();
     createRenderPass();
+
+    createDescriptorSetLayout();
     createGraphicsPipeline();
+
     createFramebuffers();
 
     // 顶点数据上传需要临时命令缓冲区，因此必须先创建命令池。
@@ -93,6 +96,10 @@ void HelloTriangleApplication::initVulkan()
 
     createVertexBuffer();
     createIndexBuffer();
+
+    createUniformBuffers();
+    createDescriptorPool();
+    createDescriptorSets();
 
     createCommandBuffers();
     createSyncObjects();
@@ -128,6 +135,46 @@ void HelloTriangleApplication::cleanup()
     }
 
     cleanupSwapChain();
+
+    // Uniform Buffer使用永久映射：先解除映射，再销毁Buffer，最后释放Memory。
+    for (size_t i = 0; i < _uniformBuffersMemory.size(); ++i) {
+        if (i < _uniformBuffersMapped.size()
+            && _uniformBuffersMapped[i] != nullptr) {
+            vkUnmapMemory(_device, _uniformBuffersMemory[i]);
+            _uniformBuffersMapped[i] = nullptr;
+        }
+
+        if (i < _uniformBuffers.size()
+            && _uniformBuffers[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(_device, _uniformBuffers[i], nullptr);
+            _uniformBuffers[i] = VK_NULL_HANDLE;
+        }
+
+        if (_uniformBuffersMemory[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(_device, _uniformBuffersMemory[i], nullptr);
+            _uniformBuffersMemory[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    // vector只保存句柄和CPU地址，清空容器本身即可。
+    _uniformBuffersMapped.clear();
+    _uniformBuffers.clear();
+    _uniformBuffersMemory.clear();
+
+    // 当前描述符池不支持单独释放Set；销毁Pool会自动释放其中全部Set。
+    _descriptorSets.clear();
+
+    // 销毁描述符池，同时释放所有由它分配的描述符集。
+    if (_descriptorPool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(_device, _descriptorPool, nullptr);
+        _descriptorPool = VK_NULL_HANDLE;
+    }
+
+    // 销毁描述符集布局，释放Uniform Buffer绑定信息。
+    if (_descriptorSetLayout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(_device, _descriptorSetLayout, nullptr);
+        _descriptorSetLayout = VK_NULL_HANDLE;
+    }
 
     // 销毁顶点缓冲区和索引缓冲区，释放GPU内存。
     if (_vertexBuffer != VK_NULL_HANDLE) {
@@ -469,6 +516,11 @@ void HelloTriangleApplication::recordCommandBuffer(
 
     // 绑定索引缓冲区，告诉GPU从哪里读取顶点索引数据。
     vkCmdBindIndexBuffer(commandBuffer, _indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+    // 绑定描述符集，将Uniform Buffer绑定到管线，供顶点着色器使用。
+    vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            _pipelineLayout, 0, 1,
+                            &_descriptorSets[_currentFrame], 0, nullptr);
 
     // 使用顶点绘制三角形，指定顶点数量、实例数量、起始顶点和实例偏移。
     // vkCmdDraw(commandBuffer, static_cast<uint32_t>(_vertices.size()), 1, 0,
@@ -890,10 +942,32 @@ void HelloTriangleApplication::createImageViews()
     }
 }
 
+void HelloTriangleApplication::createDescriptorSetLayout()
+{
+    // 描述符集布局绑定，指定Uniform Buffer绑定点、数量、类型和着色器阶段。
+    VkDescriptorSetLayoutBinding uboLayoutBinding{};
+    uboLayoutBinding.binding = 0;
+    uboLayoutBinding.descriptorCount = 1;
+    uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    uboLayoutBinding.pImmutableSamplers = nullptr;
+    uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutCreateInfo layoutInfo{};
+    layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+    layoutInfo.bindingCount = 1;
+    layoutInfo.pBindings = &uboLayoutBinding;
+
+    if (vkCreateDescriptorSetLayout(_device, &layoutInfo, nullptr,
+                                    &_descriptorSetLayout)
+        != VK_SUCCESS) {
+        throw std::runtime_error("描述符集布局创建失败");
+    }
+}
+
 void HelloTriangleApplication::createGraphicsPipeline()
 {
     // 读取编译后的SPIR-V，并创建临时Shader Module。
-    auto vertShaderCode = readShaderFile("vertIn.spv");
+    auto vertShaderCode = readShaderFile("vertInUBO.spv");
     auto fragShaderCode = readShaderFile("frag.spv");
 
     VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
@@ -955,7 +1029,7 @@ void HelloTriangleApplication::createGraphicsPipeline()
     rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
     rasterizer.lineWidth = 1.0f;
     rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-    rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+    rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterizer.depthBiasEnable = VK_FALSE;
 
     // 当前关闭多重采样，每个像素只使用一个样本。
@@ -993,11 +1067,13 @@ void HelloTriangleApplication::createGraphicsPipeline()
         static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    // 当前没有Descriptor Set和Push Constant，先创建空管线布局。
+    // 将第0组Descriptor Set Layout加入管线布局，供顶点着色器读取UBO。
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount = 0;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &_descriptorSetLayout;
     pipelineLayoutInfo.pushConstantRangeCount = 0;
+    pipelineLayoutInfo.pPushConstantRanges = nullptr;
 
     if (vkCreatePipelineLayout(_device, &pipelineLayoutInfo, nullptr,
                                &_pipelineLayout)
@@ -1178,6 +1254,94 @@ void HelloTriangleApplication::createIndexBuffer()
     vkFreeMemory(_device, stagingBufferMemory, nullptr);
 }
 
+void HelloTriangleApplication::createUniformBuffers()
+{
+    // UniformBufferObject结构体大小必须是16字节的倍数，以满足Vulkan对Uniform
+    // Buffer的对齐要求。
+    VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+    _uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+    _uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+    _uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                     VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                         | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                     _uniformBuffers[i], _uniformBuffersMemory[i]);
+
+        vkMapMemory(_device, _uniformBuffersMemory[i], 0, bufferSize, 0,
+                    &_uniformBuffersMapped[i]);
+    }
+}
+
+void HelloTriangleApplication::createDescriptorPool()
+{
+    // 描述符池大小，指定Uniform Buffer类型和数量。
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+    // 描述符池创建信息，指定池大小和最大描述符集数量。
+    VkDescriptorPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+    poolInfo.poolSizeCount = 1;
+    poolInfo.pPoolSizes = &poolSize;
+
+    poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+    // 创建描述符池对象，并检查返回值是否成功。
+    if (vkCreateDescriptorPool(_device, &poolInfo, nullptr, &_descriptorPool)
+        != VK_SUCCESS) {
+        throw std::runtime_error("描述符池创建失败");
+    }
+}
+
+void HelloTriangleApplication::createDescriptorSets()
+{
+    // 为每个并行帧分配一个描述符集，使用相同的描述符集布局。
+    std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT,
+                                               _descriptorSetLayout);
+
+    // 描述符集分配信息，指定描述符池、布局和数量。
+    VkDescriptorSetAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+    allocInfo.descriptorPool = _descriptorPool;
+    allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+    allocInfo.pSetLayouts = layouts.data();
+
+    // 分配描述符集，并检查返回值是否成功。
+    _descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+    if (vkAllocateDescriptorSets(_device, &allocInfo, _descriptorSets.data())
+        != VK_SUCCESS) {
+        throw std::runtime_error("描述符集分配失败");
+    }
+
+    // 为每个描述符集绑定Uniform Buffer对象，指定绑定点、类型和范围。
+    for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = _uniformBuffers[i];
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(UniformBufferObject);
+
+        // 更新描述符集，指定目标描述符集、绑定点、类型和缓冲区信息。
+        VkWriteDescriptorSet descriptorWrite{};
+        descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrite.dstSet = _descriptorSets[i];
+        descriptorWrite.dstBinding = 0;
+        descriptorWrite.dstArrayElement = 0;
+
+        descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrite.descriptorCount = 1;
+
+        descriptorWrite.pBufferInfo = &bufferInfo;
+        descriptorWrite.pImageInfo = nullptr;       // Optional
+        descriptorWrite.pTexelBufferView = nullptr; // Optional
+
+        vkUpdateDescriptorSets(_device, 1, &descriptorWrite, 0, nullptr);
+    }
+}
+
 void HelloTriangleApplication::createBuffer(VkDeviceSize size,
                                             VkBufferUsageFlags usage,
                                             VkMemoryPropertyFlags properties,
@@ -1191,7 +1355,7 @@ void HelloTriangleApplication::createBuffer(VkDeviceSize size,
     bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     if (vkCreateBuffer(_device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create buffer!");
+        throw std::runtime_error("Vulkan缓冲区创建失败");
     }
 
     VkMemoryRequirements memRequirements;
@@ -1205,7 +1369,7 @@ void HelloTriangleApplication::createBuffer(VkDeviceSize size,
 
     if (vkAllocateMemory(_device, &allocInfo, nullptr, &bufferMemory)
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate buffer memory!");
+        throw std::runtime_error("Vulkan缓冲区内存分配失败");
     }
 
     if (vkBindBufferMemory(_device, buffer, bufferMemory, 0) != VK_SUCCESS) {
@@ -1321,6 +1485,31 @@ void HelloTriangleApplication::createSyncObjects()
     }
 }
 
+void HelloTriangleApplication::updateUniformBuffer(uint32_t currentImage)
+{
+    static auto startTime = std::chrono::high_resolution_clock::now();
+
+    auto currentTime = std::chrono::high_resolution_clock::now();
+    float time = std::chrono::duration<float, std::chrono::seconds::period>(
+                     currentTime - startTime)
+                     .count();
+
+    UniformBufferObject ubo{};
+    ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f),
+                            glm::vec3(0.0f, 0.0f, 1.0f));
+
+    ubo.view =
+        glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f),
+                    glm::vec3(0.0f, 0.0f, 1.0f));
+
+    ubo.proj = glm::perspective(
+        glm::radians(45.0f),
+        _swapChainExtent.width / (float)_swapChainExtent.height, 0.1f, 10.0f);
+    ubo.proj[1][1] *= -1;
+
+    memcpy(_uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
+}
+
 void HelloTriangleApplication::drawFrame()
 {
     // 等待当前帧上一次提交完成，确保可以安全复用资源。
@@ -1339,6 +1528,9 @@ void HelloTriangleApplication::drawFrame()
     } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
         throw std::runtime_error("获取交换链图像失败");
     }
+
+    // 更新Uniform Buffer，传递当前帧索引以便选择对应的缓冲区。
+    updateUniformBuffer(_currentFrame);
 
     // 准备重新提交当前帧，并重新记录它的命令缓冲区。
     vkResetFences(_device, 1, &_inFlightFences[_currentFrame]);
