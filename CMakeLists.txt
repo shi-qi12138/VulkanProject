@@ -34,6 +34,9 @@ find_package(Vulkan REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)
 find_package(glm CONFIG REQUIRED)
 
+# stb是纯头文件库，vcpkg通过头文件路径提供它。
+find_path(STB_INCLUDE_DIRS "stb_image.h" REQUIRED)
+
 # 公共封装和独立示例分别管理。
 add_subdirectory(framework)
 add_subdirectory(examples)

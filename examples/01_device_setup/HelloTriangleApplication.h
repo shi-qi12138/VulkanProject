@@ -43,8 +43,8 @@ struct Vertex
 {
     glm::vec2 pos;
     glm::vec3 color;
+    glm::vec2 texCoord;
 
-    // 返回顶点输入绑定描述符，告诉Vulkan如何解释顶点缓冲区数据。
     static VkVertexInputBindingDescription getBindingDescription()
     {
         VkVertexInputBindingDescription bindingDescription{};
@@ -55,24 +55,26 @@ struct Vertex
         return bindingDescription;
     }
 
-    // 返回顶点输入属性描述符数组，告诉Vulkan每个顶点属性的位置、格式和偏移量。
-    static std::array<VkVertexInputAttributeDescription, 2>
+    static std::array<VkVertexInputAttributeDescription, 3>
     getAttributeDescriptions()
     {
-        std::array<VkVertexInputAttributeDescription, 2>
+        std::array<VkVertexInputAttributeDescription, 3>
             attributeDescriptions{};
 
-        // 位置属性描述符，绑定到顶点缓冲区的第0个绑定点，格式为2个32位浮点数。
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
         attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
         attributeDescriptions[0].offset = offsetof(Vertex, pos);
 
-        // 颜色属性描述符，绑定到顶点缓冲区的第0个绑定点，格式为3个32位浮点数。
         attributeDescriptions[1].binding = 0;
         attributeDescriptions[1].location = 1;
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
 
         return attributeDescriptions;
     }
@@ -80,9 +82,11 @@ struct Vertex
 
 struct UniformBufferObject
 {
-    glm::mat4 model;
-    glm::mat4 view;
-    glm::mat4 proj;
+    // Vulkan要求Uniform
+    // Buffer对象的对齐方式为16字节，因此使用alignas(16)确保结构体成员的对齐。
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
 };
 
 class HelloTriangleApplication
@@ -138,6 +142,24 @@ private:
 
     // 创建命令池，用于分配和管理命令缓冲区。
     void createCommandPool();
+
+    // 创建纹理图像，用于存储纹理数据。
+    void createTextureImage();
+
+    // 创建纹理图像视图，用于将纹理绑定到渲染目标。
+    void createTextureImageView();
+
+    // 创建纹理采样器，用于在片段着色器中采样纹理。
+    void createTextureSampler();
+
+    // 创建图像视图，用于将图像绑定到渲染目标。
+    VkImageView createImageView(VkImage image, VkFormat format);
+
+    // 在GPU内存中为图像分配合适的内存类型，并创建图像对象。
+    void createImage(uint32_t width, uint32_t height, VkFormat format,
+                     VkImageTiling tiling, VkImageUsageFlags usage,
+                     VkMemoryPropertyFlags properties, VkImage &image,
+                     VkDeviceMemory &imageMemory);
 
     // 创建顶点缓冲区，用于存储顶点数据。
     void createVertexBuffer();
@@ -230,6 +252,20 @@ private:
     // 在GPU内存中为缓冲区分配合适的内存类型。
     uint32_t findMemoryType(uint32_t typeFilter,
                             VkMemoryPropertyFlags properties);
+
+    // 使用命令缓冲区将数据从源图像复制到目标图像。
+    VkCommandBuffer beginSingleTimeCommands();
+
+    // 结束单次使用的命令缓冲区，并提交到图形队列执行。
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+
+    // 将图像从旧布局转换为新布局，以便在渲染或呈现时使用。
+    void transitionImageLayout(VkImage image, VkFormat format,
+                               VkImageLayout oldLayout,
+                               VkImageLayout newLayout);
+
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width,
+                           uint32_t height);
 
     // 配置并接收验证层输出的调试信息。
     // 填充Debug Messenger的创建参数。
@@ -336,6 +372,18 @@ private:
     // 每个并行帧对应的Fence，防止CPU过早复用帧资源。
     std::vector<VkFence> _inFlightFences;
 
+    // 纹理图像对象，用于存储纹理数据。
+    VkImage _textureImage;
+
+    // 纹理图像的GPU内存句柄，用于存储纹理数据。
+    VkDeviceMemory _textureImageMemory;
+
+    // 纹理图像视图，用于将纹理绑定到渲染目标。
+    VkImageView _textureImageView;
+
+    // 纹理采样器，用于在片段着色器中采样纹理。
+    VkSampler _textureSampler;
+
     // 顶点缓冲区，用于存储顶点数据。
     VkBuffer _vertexBuffer = VK_NULL_HANDLE;
 
@@ -380,10 +428,11 @@ private:
 #endif
 
 private:
-    const std::vector<Vertex> _vertices = {{{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-                                           {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-                                           {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-                                           {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}};
+    const std::vector<Vertex> _vertices = {
+        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
+        {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
+        {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
+        {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}};
 
     const std::vector<uint16_t> _indices = {0, 1, 2, 2, 3, 0};
 };
