@@ -3,7 +3,6 @@
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
-#include "glm/glm.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -41,10 +40,14 @@ struct SwapChainSupportDetails
 // 顶点数据结构，包含位置和颜色属性。
 struct Vertex
 {
+    // 顶点在模型空间中的二维位置。
     glm::vec2 pos;
+    // 顶点颜色，可在片段着色器中参与混合。
     glm::vec3 color;
+    // 纹理坐标，范围通常为0到1。
     glm::vec2 texCoord;
 
+    // 描述每个Vertex在顶点缓冲区中的步长。
     static VkVertexInputBindingDescription getBindingDescription()
     {
         VkVertexInputBindingDescription bindingDescription{};
@@ -55,6 +58,7 @@ struct Vertex
         return bindingDescription;
     }
 
+    // 描述位置、颜色和纹理坐标在Vertex中的格式与偏移。
     static std::array<VkVertexInputAttributeDescription, 3>
     getAttributeDescriptions()
     {
@@ -373,16 +377,16 @@ private:
     std::vector<VkFence> _inFlightFences;
 
     // 纹理图像对象，用于存储纹理数据。
-    VkImage _textureImage;
+    VkImage _textureImage = VK_NULL_HANDLE;
 
     // 纹理图像的GPU内存句柄，用于存储纹理数据。
-    VkDeviceMemory _textureImageMemory;
+    VkDeviceMemory _textureImageMemory = VK_NULL_HANDLE;
 
     // 纹理图像视图，用于将纹理绑定到渲染目标。
-    VkImageView _textureImageView;
+    VkImageView _textureImageView = VK_NULL_HANDLE;
 
     // 纹理采样器，用于在片段着色器中采样纹理。
-    VkSampler _textureSampler;
+    VkSampler _textureSampler = VK_NULL_HANDLE;
 
     // 顶点缓冲区，用于存储顶点数据。
     VkBuffer _vertexBuffer = VK_NULL_HANDLE;

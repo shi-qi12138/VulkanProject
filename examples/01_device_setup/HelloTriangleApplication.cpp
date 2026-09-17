@@ -632,7 +632,7 @@ HelloTriangleApplication::findMemoryType(uint32_t typeFilter,
                                          VkMemoryPropertyFlags properties)
 {
     // 查询物理设备的内存类型和堆信息。
-    VkPhysicalDeviceMemoryProperties memProperties;
+    VkPhysicalDeviceMemoryProperties memProperties{};
     vkGetPhysicalDeviceMemoryProperties(_physicalDevice, &memProperties);
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
         if ((typeFilter & (1 << i))
@@ -646,20 +646,27 @@ HelloTriangleApplication::findMemoryType(uint32_t typeFilter,
 
 VkCommandBuffer HelloTriangleApplication::beginSingleTimeCommands()
 {
+    // 临时命令缓冲区只用于一次资源复制或布局转换。
     VkCommandBufferAllocateInfo allocInfo{};
     allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     allocInfo.commandPool = _commandPool;
     allocInfo.commandBufferCount = 1;
 
-    VkCommandBuffer commandBuffer;
-    vkAllocateCommandBuffers(_device, &allocInfo, &commandBuffer);
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(_device, &allocInfo, &commandBuffer)
+        != VK_SUCCESS) {
+        throw std::runtime_error("单次命令缓冲区分配失败");
+    }
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("单次命令缓冲区开始记录失败");
+    }
 
     return commandBuffer;
 }
@@ -667,15 +674,25 @@ VkCommandBuffer HelloTriangleApplication::beginSingleTimeCommands()
 void HelloTriangleApplication::endSingleTimeCommands(
     VkCommandBuffer commandBuffer)
 {
-    vkEndCommandBuffer(commandBuffer);
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("单次命令缓冲区结束记录失败");
+    }
 
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    vkQueueSubmit(_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(_graphicsQueue);
+    if (vkQueueSubmit(_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE)
+        != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("单次命令提交失败");
+    }
+
+    if (vkQueueWaitIdle(_graphicsQueue) != VK_SUCCESS) {
+        throw std::runtime_error("等待单次命令执行完成失败");
+    }
 
     vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
 }
@@ -685,6 +702,8 @@ void HelloTriangleApplication::transitionImageLayout(VkImage image,
                                                      VkImageLayout oldLayout,
                                                      VkImageLayout newLayout)
 {
+    // 当前只处理颜色纹理；format参数为后续深度图像布局转换预留。
+    (void)format;
     VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
     VkImageMemoryBarrier barrier{};
@@ -718,7 +737,7 @@ void HelloTriangleApplication::transitionImageLayout(VkImage image,
         sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     } else {
-        throw std::invalid_argument("unsupported layout transition!");
+        throw std::invalid_argument("不支持的图像布局转换");
     }
 
     vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0,
@@ -731,6 +750,7 @@ void HelloTriangleApplication::copyBufferToImage(VkBuffer buffer, VkImage image,
                                                  uint32_t width,
                                                  uint32_t height)
 {
+    // 暂存缓冲区按紧密排列方式复制到纹理图像的第0层。
     VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
     VkBufferImageCopy region{};
@@ -880,7 +900,8 @@ int HelloTriangleApplication::rateDeviceSuitability(
     vkGetPhysicalDeviceProperties(device, &properties);
     vkGetPhysicalDeviceFeatures(device, &features);
 
-    if (!features.geometryShader) {
+    // 当前示例使用各向异性纹理过滤，设备必须支持该特性。
+    if (!features.geometryShader || !features.samplerAnisotropy) {
         return 0;
     }
 
@@ -1084,7 +1105,7 @@ void HelloTriangleApplication::createDescriptorSetLayout()
     if (vkCreateDescriptorSetLayout(_device, &layoutInfo, nullptr,
                                     &_descriptorSetLayout)
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to create descriptor set layout!");
+        throw std::runtime_error("描述符集布局创建失败");
     }
 }
 
@@ -1325,35 +1346,52 @@ void HelloTriangleApplication::createCommandPool()
 
 void HelloTriangleApplication::createTextureImage()
 {
-    int texWidth, texHeight, texChannels;
-    stbi_uc *pixels = stbi_load("D:/多媒体测试数据/Image/yang.jpg", &texWidth,
-                                &texHeight, &texChannels, STBI_rgb_alpha);
-    VkDeviceSize imageSize = texWidth * texHeight * 4;
+    // stb_image将图片统一解码为RGBA四通道像素。
+    constexpr const char *texturePath = "D:/多媒体测试数据/Image/yang.jpg";
+    int texWidth = 0;
+    int texHeight = 0;
+    int texChannels = 0;
+    stbi_uc *pixels = stbi_load(texturePath, &texWidth, &texHeight,
+                                &texChannels, STBI_rgb_alpha);
 
-    if (!pixels) {
-        throw std::runtime_error("failed to load texture image!");
+    if (pixels == nullptr) {
+        const char *reason = stbi_failure_reason();
+        throw std::runtime_error(
+            std::string("纹理图片加载失败：") + texturePath
+            + "，原因：" + (reason != nullptr ? reason : "未知"));
     }
 
-    VkBuffer stagingBuffer;
-    VkDeviceMemory stagingBufferMemory;
+    const VkDeviceSize imageSize = static_cast<VkDeviceSize>(texWidth)
+        * static_cast<VkDeviceSize>(texHeight) * STBI_rgb_alpha;
+
+    // 先把像素写入CPU可见的暂存缓冲区，再复制到GPU图像。
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
     createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  stagingBuffer, stagingBufferMemory);
 
-    void *data;
-    vkMapMemory(_device, stagingBufferMemory, 0, imageSize, 0, &data);
-    memcpy(data, pixels, static_cast<size_t>(imageSize));
+    void *data = nullptr;
+    if (vkMapMemory(_device, stagingBufferMemory, 0, imageSize, 0, &data)
+        != VK_SUCCESS) {
+        stbi_image_free(pixels);
+        throw std::runtime_error("纹理暂存缓冲区内存映射失败");
+    }
+    std::memcpy(data, pixels, static_cast<size_t>(imageSize));
     vkUnmapMemory(_device, stagingBufferMemory);
 
     stbi_image_free(pixels);
 
-    createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB,
+    // GPU图像需要同时支持接收复制数据和被Shader采样。
+    createImage(static_cast<uint32_t>(texWidth),
+                static_cast<uint32_t>(texHeight), VK_FORMAT_R8G8B8A8_SRGB,
                 VK_IMAGE_TILING_OPTIMAL,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _textureImage,
                 _textureImageMemory);
 
+    // 图像布局依次从未定义转换为复制目标，再转换为Shader只读。
     transitionImageLayout(_textureImage, VK_FORMAT_R8G8B8A8_SRGB,
                           VK_IMAGE_LAYOUT_UNDEFINED,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -1370,11 +1408,13 @@ void HelloTriangleApplication::createTextureImage()
 
 void HelloTriangleApplication::createTextureImageView()
 {
+    // Image View规定Shader如何访问纹理图像。
     _textureImageView = createImageView(_textureImage, VK_FORMAT_R8G8B8A8_SRGB);
 }
 
 void HelloTriangleApplication::createTextureSampler()
 {
+    // 使用物理设备允许的最大各向异性等级改善倾斜纹理的清晰度。
     VkPhysicalDeviceProperties properties{};
     vkGetPhysicalDeviceProperties(_physicalDevice, &properties);
 
@@ -1403,7 +1443,7 @@ void HelloTriangleApplication::createTextureSampler()
 
     if (vkCreateSampler(_device, &samplerInfo, nullptr, &_textureSampler)
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to create texture sampler!");
+        throw std::runtime_error("纹理采样器创建失败");
     }
 }
 
@@ -1421,10 +1461,10 @@ VkImageView HelloTriangleApplication::createImageView(VkImage image,
     viewInfo.subresourceRange.baseArrayLayer = 0;
     viewInfo.subresourceRange.layerCount = 1;
 
-    VkImageView imageView;
+    VkImageView imageView = VK_NULL_HANDLE;
     if (vkCreateImageView(_device, &viewInfo, nullptr, &imageView)
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to create image view!");
+        throw std::runtime_error("图像视图创建失败");
     }
 
     return imageView;
@@ -1451,7 +1491,7 @@ void HelloTriangleApplication::createImage(
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     if (vkCreateImage(_device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
-        throw std::runtime_error("failed to create image!");
+        throw std::runtime_error("Vulkan图像创建失败");
     }
 
     VkMemoryRequirements memRequirements;
@@ -1465,10 +1505,12 @@ void HelloTriangleApplication::createImage(
 
     if (vkAllocateMemory(_device, &allocInfo, nullptr, &imageMemory)
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate image memory!");
+        throw std::runtime_error("Vulkan图像内存分配失败");
     }
 
-    vkBindImageMemory(_device, image, imageMemory, 0);
+    if (vkBindImageMemory(_device, image, imageMemory, 0) != VK_SUCCESS) {
+        throw std::runtime_error("图像与设备内存绑定失败");
+    }
 }
 
 void HelloTriangleApplication::createVertexBuffer()
@@ -1563,7 +1605,7 @@ void HelloTriangleApplication::createDescriptorPool()
 
     if (vkCreateDescriptorPool(_device, &poolInfo, nullptr, &_descriptorPool)
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to create descriptor pool!");
+        throw std::runtime_error("描述符池创建失败");
     }
 }
 
@@ -1580,7 +1622,7 @@ void HelloTriangleApplication::createDescriptorSets()
     _descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
     if (vkAllocateDescriptorSets(_device, &allocInfo, _descriptorSets.data())
         != VK_SUCCESS) {
-        throw std::runtime_error("failed to allocate descriptor sets!");
+        throw std::runtime_error("描述符集分配失败");
     }
 
     for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
