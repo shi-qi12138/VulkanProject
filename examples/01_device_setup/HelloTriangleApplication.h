@@ -37,11 +37,11 @@ struct SwapChainSupportDetails
     std::vector<VkPresentModeKHR> presentModes;
 };
 
-// 顶点数据结构，包含位置和颜色属性。
+// 单个顶点的数据布局：位置、颜色和纹理坐标。
 struct Vertex
 {
-    // 顶点在模型空间中的二维位置。
-    glm::vec2 pos;
+    // 顶点在模型空间中的三维位置。
+    glm::vec3 pos;
     // 顶点颜色，可在片段着色器中参与混合。
     glm::vec3 color;
     // 纹理坐标，范围通常为0到1。
@@ -65,16 +65,19 @@ struct Vertex
         std::array<VkVertexInputAttributeDescription, 3>
             attributeDescriptions{};
 
+        // location 0：三维位置。
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
-        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[0].offset = offsetof(Vertex, pos);
 
+        // location 1：RGB颜色。
         attributeDescriptions[1].binding = 0;
         attributeDescriptions[1].location = 1;
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
 
+        // location 2：二维纹理坐标。
         attributeDescriptions[2].binding = 0;
         attributeDescriptions[2].location = 2;
         attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
@@ -86,10 +89,12 @@ struct Vertex
 
 struct UniformBufferObject
 {
-    // Vulkan要求Uniform
-    // Buffer对象的对齐方式为16字节，因此使用alignas(16)确保结构体成员的对齐。
+    // 三个矩阵按16字节对齐，以满足Shader中Uniform Buffer的布局要求。
+    // 模型矩阵：把模型局部坐标变换到世界坐标。
     alignas(16) glm::mat4 model;
+    // 观察矩阵：把世界坐标变换到相机坐标。
     alignas(16) glm::mat4 view;
+    // 投影矩阵：把相机坐标变换到裁剪空间。
     alignas(16) glm::mat4 proj;
 };
 
@@ -132,7 +137,7 @@ private:
     // 创建交换链图像的视图，用于渲染和呈现。
     void createImageViews();
 
-    // 创建描述符集布局，定义Uniform Buffer的绑定方式。
+    // 创建描述符集布局，定义Uniform Buffer和纹理的绑定位置。
     void createDescriptorSetLayout();
 
     // 创建图形管线，包括着色器、固定功能阶段和渲染状态。
@@ -147,23 +152,43 @@ private:
     // 创建命令池，用于分配和管理命令缓冲区。
     void createCommandPool();
 
+    // 创建深度图像、深度图像视图和分配GPU内存，用于深度测试。
+    void createDepthResources();
+
     // 创建纹理图像，用于存储纹理数据。
     void createTextureImage();
 
-    // 创建纹理图像视图，用于将纹理绑定到渲染目标。
+    // 创建纹理图像视图，供Shader访问纹理图像。
     void createTextureImageView();
 
     // 创建纹理采样器，用于在片段着色器中采样纹理。
     void createTextureSampler();
 
     // 创建图像视图，用于将图像绑定到渲染目标。
-    VkImageView createImageView(VkImage image, VkFormat format);
+    [[nodiscard]] VkImageView
+    createImageView(VkImage image, VkFormat format,
+                    VkImageAspectFlags aspectFlags);
 
     // 在GPU内存中为图像分配合适的内存类型，并创建图像对象。
     void createImage(uint32_t width, uint32_t height, VkFormat format,
                      VkImageTiling tiling, VkImageUsageFlags usage,
                      VkMemoryPropertyFlags properties, VkImage &image,
                      VkDeviceMemory &imageMemory);
+
+    // 分配并开始记录一个仅提交一次的临时命令缓冲区。
+    [[nodiscard]] VkCommandBuffer beginSingleTimeCommands();
+
+    // 结束单次使用的命令缓冲区，并提交到图形队列执行。
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+
+    // 将图像从旧布局转换为新布局，以便在渲染或呈现时使用。
+    void transitionImageLayout(VkImage image, VkFormat format,
+                               VkImageLayout oldLayout,
+                               VkImageLayout newLayout);
+
+    // 把暂存缓冲区中的像素复制到纹理图像。
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width,
+                           uint32_t height);
 
     // 创建顶点缓冲区，用于存储顶点数据。
     void createVertexBuffer();
@@ -177,7 +202,7 @@ private:
     // 创建描述符池，用于分配描述符集。
     void createDescriptorPool();
 
-    // 创建描述符集，将Uniform Buffer绑定到管线。
+    // 创建描述符集，将Uniform Buffer和纹理绑定到管线。
     void createDescriptorSets();
 
     // 在GPU内存中为缓冲区分配合适的内存类型，并创建缓冲区对象。
@@ -230,15 +255,16 @@ private:
     [[nodiscard]] std::vector<const char *> getRequiredExtensions() const;
 
     // 从Surface支持的像素格式中选择最合适的一种。
-    VkSurfaceFormatKHR chooseSwapSurfaceFormat(
-        const std::vector<VkSurfaceFormatKHR> &availableFormats);
+    [[nodiscard]] VkSurfaceFormatKHR chooseSwapSurfaceFormat(
+        const std::vector<VkSurfaceFormatKHR> &availableFormats) const;
 
     // 从Surface支持的呈现模式中选择最合适的一种。
-    VkPresentModeKHR chooseSwapPresentMode(
-        const std::vector<VkPresentModeKHR> &availablePresentModes);
+    [[nodiscard]] VkPresentModeKHR chooseSwapPresentMode(
+        const std::vector<VkPresentModeKHR> &availablePresentModes) const;
 
     // 从Surface支持的图像尺寸中选择最合适的一种。
-    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities);
+    [[nodiscard]] VkExtent2D
+    chooseSwapExtent(const VkSurfaceCapabilitiesKHR &capabilities) const;
 
     // 创建着色器模块，用于图形管线的顶点和片段着色器。
     VkShaderModule createShaderModule(const std::vector<char> &code);
@@ -254,22 +280,21 @@ private:
     void recreateSwapChain();
 
     // 在GPU内存中为缓冲区分配合适的内存类型。
-    uint32_t findMemoryType(uint32_t typeFilter,
-                            VkMemoryPropertyFlags properties);
+    [[nodiscard]] uint32_t
+    findMemoryType(uint32_t typeFilter,
+                   VkMemoryPropertyFlags properties) const;
 
-    // 使用命令缓冲区将数据从源图像复制到目标图像。
-    VkCommandBuffer beginSingleTimeCommands();
+    // 查找支持深度缓冲的图像格式。
+    [[nodiscard]] VkFormat findDepthFormat() const;
 
-    // 结束单次使用的命令缓冲区，并提交到图形队列执行。
-    void endSingleTimeCommands(VkCommandBuffer commandBuffer);
+    // 判断图像格式是否包含深度和模板组件。
+    [[nodiscard]] static bool hasStencilComponent(VkFormat format);
 
-    // 将图像从旧布局转换为新布局，以便在渲染或呈现时使用。
-    void transitionImageLayout(VkImage image, VkFormat format,
-                               VkImageLayout oldLayout,
-                               VkImageLayout newLayout);
-
-    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width,
-                           uint32_t height);
+    // 在GPU内存中为图像分配合适的内存类型。
+    [[nodiscard]] VkFormat
+    findSupportedFormat(const std::vector<VkFormat> &candidates,
+                        VkImageTiling tiling,
+                        VkFormatFeatureFlags features) const;
 
     // 配置并接收验证层输出的调试信息。
     // 填充Debug Messenger的创建参数。
@@ -292,7 +317,7 @@ private:
 
 private:
     // 最大同时渲染帧数，通常为2或3。
-    const int MAX_FRAMES_IN_FLIGHT = 2;
+    static constexpr size_t MAX_FRAMES_IN_FLIGHT = 2;
 
     // 窗口初始宽度。
     static constexpr uint32_t WIDTH = 800;
@@ -343,13 +368,13 @@ private:
     // 渲染通道，定义渲染目标和子通道。
     VkRenderPass _renderPass = VK_NULL_HANDLE;
 
-    // 描述符集布局，定义Uniform Buffer的绑定方式。
+    // 描述符集布局，定义Uniform Buffer和组合图像采样器的绑定方式。
     VkDescriptorSetLayout _descriptorSetLayout = VK_NULL_HANDLE;
 
     // 描述符池，用于分配描述符集。
     VkDescriptorPool _descriptorPool = VK_NULL_HANDLE;
 
-    // 描述符集，将Uniform Buffer绑定到管线。
+    // 描述符集，把每帧Uniform Buffer和纹理资源提供给Shader。
     std::vector<VkDescriptorSet> _descriptorSets;
 
     // 管线布局，描述Shader可访问的Descriptor和Push Constant。
@@ -382,8 +407,17 @@ private:
     // 纹理图像的GPU内存句柄，用于存储纹理数据。
     VkDeviceMemory _textureImageMemory = VK_NULL_HANDLE;
 
-    // 纹理图像视图，用于将纹理绑定到渲染目标。
+    // 纹理图像视图，描述Shader访问纹理的方式。
     VkImageView _textureImageView = VK_NULL_HANDLE;
+
+    // 深度图像对象，用于存储深度缓冲数据。
+    VkImage _depthImage = VK_NULL_HANDLE;
+
+    // 深度图像的GPU内存句柄，用于存储深度缓冲数据。
+    VkDeviceMemory _depthImageMemory = VK_NULL_HANDLE;
+
+    // 深度图像视图，用于将深度缓冲绑定到渲染目标。
+    VkImageView _depthImageView = VK_NULL_HANDLE;
 
     // 纹理采样器，用于在片段着色器中采样纹理。
     VkSampler _textureSampler = VK_NULL_HANDLE;
@@ -432,11 +466,19 @@ private:
 #endif
 
 private:
+    // 两个前后排列的四边形；每个顶点依次保存位置、颜色和纹理坐标。
     const std::vector<Vertex> _vertices = {
-        {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {1.0f, 0.0f}},
-        {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {0.0f, 0.0f}},
-        {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, {0.0f, 1.0f}},
-        {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}, {1.0f, 1.0f}}};
+        {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+        {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+        {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+        {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
 
-    const std::vector<uint16_t> _indices = {0, 1, 2, 2, 3, 0};
+        {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+        {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+        {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+        {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}};
+
+    // 每三个索引组成一个三角形，共绘制四个三角形。
+    const std::vector<uint16_t> _indices = {0, 1, 2, 2, 3, 0,
+                                             4, 5, 6, 6, 7, 4};
 };

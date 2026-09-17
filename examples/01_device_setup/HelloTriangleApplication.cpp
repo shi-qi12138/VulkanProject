@@ -90,10 +90,11 @@ void HelloTriangleApplication::initVulkan()
     createDescriptorSetLayout();
     createGraphicsPipeline();
 
-    createFramebuffers();
-
-    // 顶点数据上传需要临时命令缓冲区，因此必须先创建命令池。
     createCommandPool();
+
+    createDepthResources();
+
+    createFramebuffers();
 
     createTextureImage();
     createTextureImageView();
@@ -418,7 +419,7 @@ HelloTriangleApplication::getRequiredExtensions() const
 }
 
 VkSurfaceFormatKHR HelloTriangleApplication::chooseSwapSurfaceFormat(
-    const std::vector<VkSurfaceFormatKHR> &availableFormats)
+    const std::vector<VkSurfaceFormatKHR> &availableFormats) const
 {
     // 优先选择SRGB颜色空间和B8G8R8A8格式。
     for (const auto &availableFormat : availableFormats) {
@@ -434,7 +435,7 @@ VkSurfaceFormatKHR HelloTriangleApplication::chooseSwapSurfaceFormat(
 }
 
 VkPresentModeKHR HelloTriangleApplication::chooseSwapPresentMode(
-    const std::vector<VkPresentModeKHR> &availablePresentModes)
+    const std::vector<VkPresentModeKHR> &availablePresentModes) const
 {
     // 优先选择Mailbox模式，它允许在屏幕刷新前多次更新图像，减少撕裂。
     for (const auto &availablePresentMode : availablePresentModes) {
@@ -448,7 +449,7 @@ VkPresentModeKHR HelloTriangleApplication::chooseSwapPresentMode(
 }
 
 VkExtent2D HelloTriangleApplication::chooseSwapExtent(
-    const VkSurfaceCapabilitiesKHR &capabilities)
+    const VkSurfaceCapabilitiesKHR &capabilities) const
 {
     // 如果Surface的当前尺寸不是最大值，则直接使用它。
     if (capabilities.currentExtent.width
@@ -503,6 +504,10 @@ void HelloTriangleApplication::recordCommandBuffer(
         throw std::runtime_error("命令缓冲区开始记录失败");
     }
 
+    std::array<VkClearValue, 2> clearValues{};
+    clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    clearValues[1].depthStencil = {1.0f, 0};
+
     // 选择当前交换链图像对应的Framebuffer并设置清屏范围。
     VkRenderPassBeginInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -514,8 +519,8 @@ void HelloTriangleApplication::recordCommandBuffer(
 
     // 渲染开始时把颜色附件清除为不透明黑色。
     VkClearValue clearColor = {{{0.0f, 0.0f, 0.0f, 1.0f}}};
-    renderPassInfo.clearValueCount = 1;
-    renderPassInfo.pClearValues = &clearColor;
+    renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+    renderPassInfo.pClearValues = clearValues.data();
 
     vkCmdBeginRenderPass(commandBuffer, &renderPassInfo,
                          VK_SUBPASS_CONTENTS_INLINE);
@@ -571,11 +576,27 @@ void HelloTriangleApplication::recordCommandBuffer(
 
 void HelloTriangleApplication::cleanupSwapChain()
 {
-    // 销毁交换链帧缓冲区，释放相关资源。
-    for (auto framebuffer : _swapChainFramebuffers) {
+    // Framebuffer引用颜色和深度图像视图，因此必须最先销毁。
+    for (VkFramebuffer framebuffer : _swapChainFramebuffers) {
         vkDestroyFramebuffer(_device, framebuffer, nullptr);
     }
     _swapChainFramebuffers.clear();
+
+    // 按“视图 -> 图像 -> 内存”的依赖顺序释放深度资源。
+    if (_depthImageView != VK_NULL_HANDLE) {
+        vkDestroyImageView(_device, _depthImageView, nullptr);
+        _depthImageView = VK_NULL_HANDLE;
+    }
+
+    if (_depthImage != VK_NULL_HANDLE) {
+        vkDestroyImage(_device, _depthImage, nullptr);
+        _depthImage = VK_NULL_HANDLE;
+    }
+
+    if (_depthImageMemory != VK_NULL_HANDLE) {
+        vkFreeMemory(_device, _depthImageMemory, nullptr);
+        _depthImageMemory = VK_NULL_HANDLE;
+    }
 
     // 销毁交换链图像视图，释放图像资源。
     for (auto imageView : _swapChainImageViews) {
@@ -604,6 +625,7 @@ void HelloTriangleApplication::recreateSwapChain()
     // 确保GPU不再使用旧交换链资源。
     vkDeviceWaitIdle(_device);
 
+    // 清理旧交换链资源，包括帧缓冲区、图像视图和交换链本身。
     cleanupSwapChain();
 
     // 渲染完成信号量与交换链图像一一对应，需要同步重建。
@@ -612,8 +634,10 @@ void HelloTriangleApplication::recreateSwapChain()
     }
     _renderFinishedSemaphores.clear();
 
+    // 重新创建交换链、图像视图、深度资源和帧缓冲区。
     createSwapChain();
     createImageViews();
+    createDepthResources();
     createFramebuffers();
 
     _renderFinishedSemaphores.resize(_swapChainImages.size());
@@ -629,7 +653,7 @@ void HelloTriangleApplication::recreateSwapChain()
 
 uint32_t
 HelloTriangleApplication::findMemoryType(uint32_t typeFilter,
-                                         VkMemoryPropertyFlags properties)
+                                         VkMemoryPropertyFlags properties) const
 {
     // 查询物理设备的内存类型和堆信息。
     VkPhysicalDeviceMemoryProperties memProperties{};
@@ -644,130 +668,39 @@ HelloTriangleApplication::findMemoryType(uint32_t typeFilter,
     throw std::runtime_error("未找到合适的内存类型");
 }
 
-VkCommandBuffer HelloTriangleApplication::beginSingleTimeCommands()
+VkFormat HelloTriangleApplication::findDepthFormat() const
 {
-    // 临时命令缓冲区只用于一次资源复制或布局转换。
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandPool = _commandPool;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(_device, &allocInfo, &commandBuffer)
-        != VK_SUCCESS) {
-        throw std::runtime_error("单次命令缓冲区分配失败");
-    }
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
-        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
-        throw std::runtime_error("单次命令缓冲区开始记录失败");
-    }
-
-    return commandBuffer;
+    return findSupportedFormat({VK_FORMAT_D32_SFLOAT,
+                                VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                VK_FORMAT_D24_UNORM_S8_UINT},
+                               VK_IMAGE_TILING_OPTIMAL,
+                               VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT);
 }
 
-void HelloTriangleApplication::endSingleTimeCommands(
-    VkCommandBuffer commandBuffer)
+bool HelloTriangleApplication::hasStencilComponent(VkFormat format)
 {
-    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
-        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
-        throw std::runtime_error("单次命令缓冲区结束记录失败");
-    }
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
-
-    if (vkQueueSubmit(_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE)
-        != VK_SUCCESS) {
-        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
-        throw std::runtime_error("单次命令提交失败");
-    }
-
-    if (vkQueueWaitIdle(_graphicsQueue) != VK_SUCCESS) {
-        throw std::runtime_error("等待单次命令执行完成失败");
-    }
-
-    vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+    return format == VK_FORMAT_D32_SFLOAT_S8_UINT
+           || format == VK_FORMAT_D24_UNORM_S8_UINT;
 }
 
-void HelloTriangleApplication::transitionImageLayout(VkImage image,
-                                                     VkFormat format,
-                                                     VkImageLayout oldLayout,
-                                                     VkImageLayout newLayout)
+VkFormat HelloTriangleApplication::findSupportedFormat(
+    const std::vector<VkFormat> &candidates, VkImageTiling tiling,
+    VkFormatFeatureFlags features) const
 {
-    // 当前只处理颜色纹理；format参数为后续深度图像布局转换预留。
-    (void)format;
-    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+    for (VkFormat format : candidates) {
+        VkFormatProperties props;
+        vkGetPhysicalDeviceFormatProperties(_physicalDevice, format, &props);
 
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags sourceStage;
-    VkPipelineStageFlags destinationStage;
-
-    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
-        && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        barrier.srcAccessMask = 0;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-               && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-        sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    } else {
-        throw std::invalid_argument("不支持的图像布局转换");
+        if (tiling == VK_IMAGE_TILING_LINEAR
+            && (props.linearTilingFeatures & features) == features) {
+            return format;
+        } else if (tiling == VK_IMAGE_TILING_OPTIMAL
+                   && (props.optimalTilingFeatures & features) == features) {
+            return format;
+        }
     }
 
-    vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0,
-                         nullptr, 0, nullptr, 1, &barrier);
-
-    endSingleTimeCommands(commandBuffer);
-}
-
-void HelloTriangleApplication::copyBufferToImage(VkBuffer buffer, VkImage image,
-                                                 uint32_t width,
-                                                 uint32_t height)
-{
-    // 暂存缓冲区按紧密排列方式复制到纹理图像的第0层。
-    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
-
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.bufferRowLength = 0;
-    region.bufferImageHeight = 0;
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = {width, height, 1};
-
-    vkCmdCopyBufferToImage(commandBuffer, buffer, image,
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    endSingleTimeCommands(commandBuffer);
+    throw std::runtime_error("未找到支持的格式");
 }
 
 VKAPI_ATTR VkBool32 VKAPI_CALL HelloTriangleApplication::debugCallback(
@@ -1074,7 +1007,8 @@ void HelloTriangleApplication::createImageViews()
 
     for (uint32_t i = 0; i < _swapChainImages.size(); i++) {
         _swapChainImageViews[i] =
-            createImageView(_swapChainImages[i], _swapChainImageFormat);
+            createImageView(_swapChainImages[i], _swapChainImageFormat,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
     }
 }
 
@@ -1184,6 +1118,16 @@ void HelloTriangleApplication::createGraphicsPipeline()
     multisampling.sampleShadingEnable = VK_FALSE;
     multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+    // 开启深度测试，使用小于比较函数，允许写入深度缓冲区。
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+    depthStencil.depthBoundsTestEnable = VK_FALSE;
+    depthStencil.stencilTestEnable = VK_FALSE;
+
     // 允许写入RGBA四个通道，暂时关闭颜色混合。
     VkPipelineColorBlendAttachmentState colorBlendAttachment{};
     colorBlendAttachment.colorWriteMask =
@@ -1212,18 +1156,15 @@ void HelloTriangleApplication::createGraphicsPipeline()
         static_cast<uint32_t>(dynamicStates.size());
     dynamicState.pDynamicStates = dynamicStates.data();
 
-    // 将第0组Descriptor Set Layout加入管线布局，供顶点着色器读取UBO。
     VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
     pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipelineLayoutInfo.setLayoutCount = 1;
     pipelineLayoutInfo.pSetLayouts = &_descriptorSetLayout;
-    pipelineLayoutInfo.pushConstantRangeCount = 0;
-    pipelineLayoutInfo.pPushConstantRanges = nullptr;
 
     if (vkCreatePipelineLayout(_device, &pipelineLayoutInfo, nullptr,
                                &_pipelineLayout)
         != VK_SUCCESS) {
-        throw std::runtime_error("图形管线布局创建失败");
+        throw std::runtime_error("Vulkan管线布局创建失败");
     }
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -1235,6 +1176,7 @@ void HelloTriangleApplication::createGraphicsPipeline()
     pipelineInfo.pViewportState = &viewportState;
     pipelineInfo.pRasterizationState = &rasterizer;
     pipelineInfo.pMultisampleState = &multisampling;
+    pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pColorBlendState = &colorBlending;
     pipelineInfo.pDynamicState = &dynamicState;
     pipelineInfo.layout = _pipelineLayout;
@@ -1248,7 +1190,6 @@ void HelloTriangleApplication::createGraphicsPipeline()
         throw std::runtime_error("Vulkan图形管线创建失败");
     }
 
-    // 管线布局创建后不再需要Shader Module，可以立即释放。
     vkDestroyShaderModule(_device, fragShaderModule, nullptr);
     vkDestroyShaderModule(_device, vertShaderModule, nullptr);
 }
@@ -1271,29 +1212,51 @@ void HelloTriangleApplication::createRenderPass()
     colorAttachmentRef.attachment = 0;
     colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+    // 深度附件对应深度缓冲区：开始时清除，结束后不保留内容。
+    VkAttachmentDescription depthAttachment{};
+    depthAttachment.format = findDepthFormat();
+    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    depthAttachment.finalLayout =
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+    // 子通道执行期间，图像使用最适合深度写入的布局。
+    VkAttachmentReference depthAttachmentRef{};
+    depthAttachmentRef.attachment = 1;
+    depthAttachmentRef.layout =
+        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
     // 当前Render Pass只有一个图形子通道和一个颜色附件。
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &colorAttachmentRef;
+    subpass.pDepthStencilAttachment = &depthAttachmentRef;
 
     // 等待颜色附件可用后，才允许子通道写入颜色。
     VkSubpassDependency dependency{};
     dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
     dependency.dstSubpass = 0;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependency.srcAccessMask = 0;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                              | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                              | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                               | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
+    std::array<VkAttachmentDescription, 2> attachments = {colorAttachment,
+                                                          depthAttachment};
     VkRenderPassCreateInfo renderPassInfo{};
     renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    renderPassInfo.attachmentCount = 1;
-    renderPassInfo.pAttachments = &colorAttachment;
-
+    renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+    renderPassInfo.pAttachments = attachments.data();
     renderPassInfo.subpassCount = 1;
     renderPassInfo.pSubpasses = &subpass;
-
     renderPassInfo.dependencyCount = 1;
     renderPassInfo.pDependencies = &dependency;
 
@@ -1309,13 +1272,16 @@ void HelloTriangleApplication::createFramebuffers()
     _swapChainFramebuffers.resize(_swapChainImageViews.size());
 
     for (size_t i = 0; i < _swapChainImageViews.size(); i++) {
-        VkImageView attachments[] = {_swapChainImageViews[i]};
+
+        std::array<VkImageView, 2> attachments = {_swapChainImageViews[i],
+                                                  _depthImageView};
 
         VkFramebufferCreateInfo framebufferInfo{};
         framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
         framebufferInfo.renderPass = _renderPass;
-        framebufferInfo.attachmentCount = 1;
-        framebufferInfo.pAttachments = attachments;
+        framebufferInfo.attachmentCount =
+            static_cast<uint32_t>(attachments.size());
+        framebufferInfo.pAttachments = attachments.data();
         framebufferInfo.width = _swapChainExtent.width;
         framebufferInfo.height = _swapChainExtent.height;
         framebufferInfo.layers = 1;
@@ -1344,6 +1310,20 @@ void HelloTriangleApplication::createCommandPool()
     }
 }
 
+void HelloTriangleApplication::createDepthResources()
+{
+    // 深度格式必须同时受到GPU和最优平铺方式支持。
+    const VkFormat depthFormat = findDepthFormat();
+
+    createImage(
+        _swapChainExtent.width, _swapChainExtent.height, depthFormat,
+        VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, _depthImage, _depthImageMemory);
+
+    _depthImageView =
+        createImageView(_depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+}
+
 void HelloTriangleApplication::createTextureImage()
 {
     // stb_image将图片统一解码为RGBA四通道像素。
@@ -1356,13 +1336,14 @@ void HelloTriangleApplication::createTextureImage()
 
     if (pixels == nullptr) {
         const char *reason = stbi_failure_reason();
-        throw std::runtime_error(
-            std::string("纹理图片加载失败：") + texturePath
-            + "，原因：" + (reason != nullptr ? reason : "未知"));
+        throw std::runtime_error(std::string("纹理图片加载失败：") + texturePath
+                                 + "，原因："
+                                 + (reason != nullptr ? reason : "未知"));
     }
 
     const VkDeviceSize imageSize = static_cast<VkDeviceSize>(texWidth)
-        * static_cast<VkDeviceSize>(texHeight) * STBI_rgb_alpha;
+                                   * static_cast<VkDeviceSize>(texHeight)
+                                   * STBI_rgb_alpha;
 
     // 先把像素写入CPU可见的暂存缓冲区，再复制到GPU图像。
     VkBuffer stagingBuffer = VK_NULL_HANDLE;
@@ -1409,7 +1390,8 @@ void HelloTriangleApplication::createTextureImage()
 void HelloTriangleApplication::createTextureImageView()
 {
     // Image View规定Shader如何访问纹理图像。
-    _textureImageView = createImageView(_textureImage, VK_FORMAT_R8G8B8A8_SRGB);
+    _textureImageView = createImageView(_textureImage, VK_FORMAT_R8G8B8A8_SRGB,
+                                        VK_IMAGE_ASPECT_COLOR_BIT);
 }
 
 void HelloTriangleApplication::createTextureSampler()
@@ -1447,15 +1429,16 @@ void HelloTriangleApplication::createTextureSampler()
     }
 }
 
-VkImageView HelloTriangleApplication::createImageView(VkImage image,
-                                                      VkFormat format)
+VkImageView
+HelloTriangleApplication::createImageView(VkImage image, VkFormat format,
+                                          VkImageAspectFlags aspectFlags)
 {
     VkImageViewCreateInfo viewInfo{};
     viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
     viewInfo.image = image;
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
-    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.aspectMask = aspectFlags;
     viewInfo.subresourceRange.baseMipLevel = 0;
     viewInfo.subresourceRange.levelCount = 1;
     viewInfo.subresourceRange.baseArrayLayer = 0;
@@ -1513,20 +1496,167 @@ void HelloTriangleApplication::createImage(
     }
 }
 
+VkCommandBuffer HelloTriangleApplication::beginSingleTimeCommands()
+{
+    // 临时命令缓冲区只用于一次资源复制或布局转换。
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = _commandPool;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(_device, &allocInfo, &commandBuffer)
+        != VK_SUCCESS) {
+        throw std::runtime_error("单次命令缓冲区分配失败");
+    }
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("单次命令缓冲区开始记录失败");
+    }
+
+    return commandBuffer;
+}
+
+void HelloTriangleApplication::endSingleTimeCommands(
+    VkCommandBuffer commandBuffer)
+{
+    if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("单次命令缓冲区结束记录失败");
+    }
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    if (vkQueueSubmit(_graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE)
+        != VK_SUCCESS) {
+        vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+        throw std::runtime_error("单次命令提交失败");
+    }
+
+    if (vkQueueWaitIdle(_graphicsQueue) != VK_SUCCESS) {
+        throw std::runtime_error("等待单次命令执行完成失败");
+    }
+
+    vkFreeCommandBuffers(_device, _commandPool, 1, &commandBuffer);
+}
+
+void HelloTriangleApplication::transitionImageLayout(VkImage image,
+                                                     VkFormat format,
+                                                     VkImageLayout oldLayout,
+                                                     VkImageLayout newLayout)
+{
+    // 根据目标布局选择图像的颜色或深度/模板区域。
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    if (newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        if (hasStencilComponent(format)) {
+            barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+        }
+    } else {
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    }
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    VkPipelineStageFlags sourceStage;
+    VkPipelineStageFlags destinationStage;
+
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+        && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+               && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+               && newLayout
+                      == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                                | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+        sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+    } else {
+        throw std::invalid_argument("不支持的图像布局转换");
+    }
+
+    vkCmdPipelineBarrier(commandBuffer, sourceStage, destinationStage, 0, 0,
+                         nullptr, 0, nullptr, 1, &barrier);
+
+    endSingleTimeCommands(commandBuffer);
+}
+
+void HelloTriangleApplication::copyBufferToImage(VkBuffer buffer, VkImage image,
+                                                 uint32_t width,
+                                                 uint32_t height)
+{
+    // 暂存缓冲区按紧密排列方式复制到纹理图像的第0层。
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {width, height, 1};
+
+    vkCmdCopyBufferToImage(commandBuffer, buffer, image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    endSingleTimeCommands(commandBuffer);
+}
+
 void HelloTriangleApplication::createVertexBuffer()
 {
-    VkDeviceSize bufferSize = sizeof(_vertices[0]) * _vertices.size();
+    // 顶点数据先写入CPU可见内存，再复制到GPU本地内存。
+    const VkDeviceSize bufferSize = sizeof(_vertices[0]) * _vertices.size();
 
-    VkBuffer stagingBuffer;
-    VkDeviceMemory stagingBufferMemory;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
     createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  stagingBuffer, stagingBufferMemory);
 
-    void *data;
-    vkMapMemory(_device, stagingBufferMemory, 0, bufferSize, 0, &data);
-    memcpy(data, _vertices.data(), (size_t)bufferSize);
+    void *data = nullptr;
+    if (vkMapMemory(_device, stagingBufferMemory, 0, bufferSize, 0, &data)
+        != VK_SUCCESS) {
+        vkDestroyBuffer(_device, stagingBuffer, nullptr);
+        vkFreeMemory(_device, stagingBufferMemory, nullptr);
+        throw std::runtime_error("顶点暂存缓冲区内存映射失败");
+    }
+    std::memcpy(data, _vertices.data(), static_cast<size_t>(bufferSize));
     vkUnmapMemory(_device, stagingBufferMemory);
 
     createBuffer(bufferSize,
@@ -1543,18 +1673,24 @@ void HelloTriangleApplication::createVertexBuffer()
 
 void HelloTriangleApplication::createIndexBuffer()
 {
-    VkDeviceSize bufferSize = sizeof(_indices[0]) * _indices.size();
+    // 索引数据也通过暂存缓冲区上传到GPU本地内存。
+    const VkDeviceSize bufferSize = sizeof(_indices[0]) * _indices.size();
 
-    VkBuffer stagingBuffer;
-    VkDeviceMemory stagingBufferMemory;
+    VkBuffer stagingBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory stagingBufferMemory = VK_NULL_HANDLE;
     createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
                  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
                      | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                  stagingBuffer, stagingBufferMemory);
 
-    void *data;
-    vkMapMemory(_device, stagingBufferMemory, 0, bufferSize, 0, &data);
-    memcpy(data, _indices.data(), (size_t)bufferSize);
+    void *data = nullptr;
+    if (vkMapMemory(_device, stagingBufferMemory, 0, bufferSize, 0, &data)
+        != VK_SUCCESS) {
+        vkDestroyBuffer(_device, stagingBuffer, nullptr);
+        vkFreeMemory(_device, stagingBufferMemory, nullptr);
+        throw std::runtime_error("索引暂存缓冲区内存映射失败");
+    }
+    std::memcpy(data, _indices.data(), static_cast<size_t>(bufferSize));
     vkUnmapMemory(_device, stagingBufferMemory);
 
     createBuffer(
@@ -1572,7 +1708,7 @@ void HelloTriangleApplication::createUniformBuffers()
 {
     // UniformBufferObject结构体大小必须是16字节的倍数，以满足Vulkan对Uniform
     // Buffer的对齐要求。
-    VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+    const VkDeviceSize bufferSize = sizeof(UniformBufferObject);
 
     _uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
     _uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
@@ -1584,8 +1720,12 @@ void HelloTriangleApplication::createUniformBuffers()
                          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
                      _uniformBuffers[i], _uniformBuffersMemory[i]);
 
-        vkMapMemory(_device, _uniformBuffersMemory[i], 0, bufferSize, 0,
-                    &_uniformBuffersMapped[i]);
+        // 保持永久映射，逐帧更新时只需memcpy，不必反复映射。
+        if (vkMapMemory(_device, _uniformBuffersMemory[i], 0, bufferSize, 0,
+                        &_uniformBuffersMapped[i])
+            != VK_SUCCESS) {
+            throw std::runtime_error("Uniform Buffer内存映射失败");
+        }
     }
 }
 
